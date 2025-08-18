@@ -476,6 +476,14 @@ async fn setup_tls(pg: PgConfig) -> eyre::Result<(Option<TlsAcceptor>, bool)> {
             .context("ca_file required in tls config for server client cert auth verification")?;
 
         let ca_certs = tokio::fs::read(&ca_file).await?;
+        let ca_certs = if ca_file.extension() == Some("der") {
+            vec![rustls::Certificate(ca_certs)]
+        } else {
+            rustls_pemfile::certs(&mut &*ca_certs)?
+                .into_iter()
+                .map(rustls::Certificate)
+                .collect()
+        };
 
         let mut root_store = rustls::RootCertStore::empty();
 
