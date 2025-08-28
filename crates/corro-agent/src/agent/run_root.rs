@@ -45,7 +45,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
         gossip_server_endpoint,
         transport,
         api_listeners,
-        tripwire,
+        mut tripwire,
         lock_registry,
         rx_bcast,
         rx_apply,
@@ -110,7 +110,7 @@ async fn run(agent: Agent, opts: AgentOptions, pconf: PerfConfig) -> eyre::Resul
     // Setup client http API
     util::setup_http_api_handler(
         &agent,
-        &tripwire,
+        &mut tripwire,
         subs_bcast_cache,
         updates_bcast_cache,
         &subs_manager,
