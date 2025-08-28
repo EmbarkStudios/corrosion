@@ -14,6 +14,7 @@ antithesis_sdk = { workspace = true }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-macros = "0.5"
 backoff = { path = "../backoff" }
 bincode = { workspace = true }
 bytes = { workspace = true }
@@ -45,7 +46,6 @@ rand = { workspace = true }
 rangemap = { workspace = true }
 rusqlite = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile.workspace = true
 seahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
