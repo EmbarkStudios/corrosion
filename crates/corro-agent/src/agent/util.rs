@@ -43,6 +43,7 @@ use axum_extra::{
 };
 use corro_types::broadcast::Timestamp;
 use foca::Member;
+use futures::FutureExt;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};

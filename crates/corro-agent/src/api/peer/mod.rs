@@ -182,14 +182,6 @@ async fn build_quinn_server_config(config: &GossipConfig) -> eyre::Result<quinn:
             )?;
 
             let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension() == Some("der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
 
             let mut root_store = rustls::RootCertStore::empty();
 
@@ -242,16 +234,6 @@ async fn build_quinn_client_config(config: &GossipConfig) -> eyre::Result<quinn:
         let client_crypto = rustls::ClientConfig::builder();
 
         let client_crypto = if let Some(ca_file) = &tls.ca_file {
-            let ca_certs = tokio::fs::read(&ca_file).await?;
-            let ca_certs = if ca_file.extension() == Some("der") {
-                vec![rustls::Certificate(ca_certs)]
-            } else {
-                rustls_pemfile::certs(&mut &*ca_certs)?
-                    .into_iter()
-                    .map(rustls::Certificate)
-                    .collect()
-            };
-
             let mut root_store = rustls::RootCertStore::empty();
             let ca_certs = tokio::fs::read(&ca_file).await?;
             if ca_file.extension() == Some("der") {

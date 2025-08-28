@@ -35,6 +35,7 @@ pub struct SubParams {
     skip_rows: bool,
 }
 
+#[axum_macros::debug_handler]
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
