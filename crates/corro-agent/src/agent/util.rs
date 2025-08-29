@@ -304,7 +304,7 @@ pub async fn setup_http_api_handler(
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
 
-        let svc = api.clone();
+        let mut svc = api.clone();
         let mut tw = tripwire.clone();
         let handle = spawn_counted(async move {
             loop {
