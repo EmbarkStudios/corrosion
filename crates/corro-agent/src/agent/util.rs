@@ -47,7 +47,6 @@ use axum_extra::{
 };
 use corro_types::broadcast::Timestamp;
 use foca::Member;
-use futures::FutureExt;
 use http::StatusCode;
 use metrics::{counter, histogram};
 use rangemap::{RangeInclusiveMap, RangeInclusiveSet};
@@ -189,7 +188,7 @@ pub async fn setup_http_api_handler(
     updates_bcast_cache: SharedUpdateBroadcastCache,
     subs_manager: &SubsManager,
     api_listeners: Vec<TcpListener>,
-) -> eyre::Result<Vec<JoinHandle<()>>> {
+) -> eyre::Result<Vec<tokio::task::JoinHandle<()>>> {
     let api = Router::new()
         // transactions
         .route(
@@ -310,7 +309,7 @@ pub async fn setup_http_api_handler(
         let api_addr = api_listener.local_addr()?;
         info!("Starting API listener on tcp/{api_addr}");
 
-        let mut svc = api.clone();
+        let svc = api.clone();
         let mut tw = tripwire.clone();
         let handle = spawn_counted(async move {
             loop {
