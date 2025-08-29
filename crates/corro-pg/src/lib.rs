@@ -684,10 +684,7 @@ pub async fn start(
                     }
                 }
 
-                framed
-                    .codec_mut()
-                    .client_info
-                    .set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                framed.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
 
                 framed
                     .feed(PgWireBackendMessage::Authentication(
