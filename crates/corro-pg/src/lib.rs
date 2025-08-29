@@ -563,20 +563,6 @@ pub async fn start(
                 } else {
                     trace!("received SSL connection attempt without a TLS acceptor configured");
                     return Ok(());
-                }
-
-                let (which, secured) = match (tls_acceptor, is_sslrequest) {
-                    (Some(tls_acceptor), true) => {
-                        conn.write_all(b"S").await?;
-                        let tls_conn = tls_acceptor.accept(conn).await?;
-                        (Either::Left(tls_conn), true)
-                    }
-                    (_, is_sslreq) => {
-                        if is_sslreq {
-                            conn.write_all(b"N").await?;
-                        }
-                        (Either::Right(conn), false)
-                    }
                 };
 
                 trace!("SSL ? {secured}");
@@ -610,10 +596,7 @@ pub async fn start(
                     }
                 }
 
-                framed
-                    .codec_mut()
-                    .client_info
-                    .set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
+                framed.set_state(pgwire::api::PgWireConnectionState::ReadyForQuery);
 
                 framed
                     .feed(PgWireBackendMessage::Authentication(
