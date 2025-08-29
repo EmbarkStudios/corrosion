@@ -1083,7 +1083,6 @@ dependencies = [
 name = "corro-pg"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "bytes",
  "camino",
  "chrono",
