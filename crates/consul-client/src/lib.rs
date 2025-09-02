@@ -6,7 +6,6 @@ use std::{
 };
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_with::{serde_as, NoneAsEmptyString};
 
 use rusqlite::types::{FromSql, FromSqlError, ValueRef};
 
@@ -165,8 +164,25 @@ pub struct AgentService {
     pub address: String,
 }
 
+mod none_as_empty {
+    pub(super) fn serialize<S>(notes: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(notes.as_deref().unwrap_or(""))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::Deserialize;
+        let notes = String::deserialize(deserializer)?;
+        Ok((!notes.is_empty()).then_some(notes))
+    }
+}
+
 /// A health check registered on the local Consul agent.
-#[serde_as]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all(deserialize = "PascalCase"))]
 pub struct AgentCheck {
@@ -178,7 +194,7 @@ pub struct AgentCheck {
     #[serde(rename(deserialize = "ServiceID"))]
     pub service_id: String,
     pub service_name: String,
-    #[serde_as(as = "NoneAsEmptyString")]
+    #[serde(with = "none_as_empty")]
     pub notes: Option<String>,
 }
 
