@@ -67,9 +67,9 @@ serde_json = { version = "1.0.95", features = ["raw_value"] }
 smallvec = { version = "1.11.0", features = ["serde", "write", "union"] }
 speedy = { version = "0.8.7", features = ["uuid", "smallvec", "indexmap"], package = "corro-speedy" }
 sqlite3-parser = "0.12.0"
-strum = { version = "0.24.1", features = ["derive"] }
+strum = { version = "0.27", features = ["derive"] }
 tempfile = "3.5.0"
-thiserror = "1.0.40"
+thiserror = "2.0"
 time = { version = "0.3.15", features = ["macros", "serde-well-known"] }
 tokio = { version = "1.41", features = ["full"] }
 tokio-metrics = "0.3.0"
