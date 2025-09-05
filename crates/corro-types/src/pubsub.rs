@@ -411,14 +411,52 @@ impl MatcherHandle {
         tx: mpsc::Sender<QueryEvent>,
     ) -> rusqlite::Result<ChangeId> {
         self.wait_for_running_state();
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed_columns().len()) {
-            query_cols.push(format!("col_{i}"));
-        }
-        let mut prepped = conn.prepare_cached(&format!(
-            "SELECT id, type, __corro_rowid, {} FROM changes WHERE id > ? ORDER BY id ASC",
-            query_cols.join(",")
-        ))?;
+        let prepped_query = {
+            const PREFIX: &str = "SELECT id, type, __corro_rowid, ";
+            const SUFFIX: &str = " FROM changes WHERE id > ? ORDER BY id ASC";
+
+            let cols = self.parsed_columns().len();
+
+            fn col_len(num: usize) -> usize {
+                // SQLite defaults to a maximum of 2000 columns
+                debug_assert!(num <= 2000 && num > 0);
+
+                const fn len_for_count(count: usize, digits: usize) -> usize {
+                    count * digits + count * 5
+                }
+
+                let mut total = 0;
+                for (digits, low, high) in
+                    [(1, 0, 10), (2, 10, 100), (3, 100, 1000), (4, 1000, 10000)]
+                {
+                    if num < high {
+                        total += len_for_count(num - low, digits);
+                        break;
+                    }
+
+                    total += len_for_count(high - low, digits);
+                }
+
+                total - 1
+            }
+
+            let mut pq = String::with_capacity(PREFIX.len() + SUFFIX.len() + col_len(cols));
+            pq.push_str(PREFIX);
+
+            for i in 0..cols {
+                if i > 0 {
+                    pq.push(',');
+                }
+
+                use std::fmt::Write;
+                write!(&mut pq, "col_{i}").unwrap();
+            }
+
+            pq.push_str(SUFFIX);
+            pq
+        };
+
+        let mut prepped = conn.prepare_cached(&prepped_query)?;
 
         let col_count = prepped.column_count();
 
@@ -426,12 +464,7 @@ impl MatcherHandle {
 
         let mut rows = prepped.query([since])?;
 
-        loop {
-            let row = match rows.next()? {
-                Some(row) => row,
-                None => break,
-            };
-
+        while let Some(row) = rows.next()? {
             let change_id: ChangeId = row.get(0)?;
             if change_id.0 > max_change_id.0 {
                 max_change_id = change_id;
