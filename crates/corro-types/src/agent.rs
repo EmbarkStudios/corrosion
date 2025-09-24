@@ -3,8 +3,11 @@ use std::{
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -558,18 +561,19 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>>(
+    pub async fn create<P: Into<PathBuf>>(
         path: P,
         write_sema: Arc<Semaphore>,
         cache_size_kib: i64,
     ) -> Result<Self, SplitPoolCreateError> {
-        let rw_pool = sqlite_pool::Config::new(path.as_ref())
+        let path = path.into();
+        let rw_pool = sqlite_pool::Config::new(path.clone())
             .max_size(1)
             .create_pool_transform(move |conn| rusqlite_to_crsqlite_write(conn, cache_size_kib))?;
 
         debug!("built RW pool");
 
-        let ro_pool = sqlite_pool::Config::new(path.as_ref())
+        let ro_pool = sqlite_pool::Config::new(path.clone())
             .read_only()
             .max_size(20)
             .create_pool_transform(rusqlite_to_crsqlite)?;
@@ -582,6 +586,19 @@ impl SplitPool {
             ro_pool,
             rw_pool,
         ))
+    }
+
+    pub async fn create_in_memory(
+        name: &str,
+        write_sema: Arc<Semaphore>,
+        cache_size_kib: i64,
+    ) -> Result<Self, SplitPoolCreateError> {
+        Self::create(
+            format!("file:{name}?mode=memory&cache=shared"),
+            write_sema,
+            cache_size_kib,
+        )
+        .await
     }
 
     fn new(
