@@ -6,7 +6,7 @@ use std::{
     io,
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -483,28 +483,31 @@ pub enum SplitPoolCreateError {
 }
 
 impl SplitPool {
-    pub async fn create<P: AsRef<Path>>(
+    pub async fn create<P: Into<PathBuf>>(
         path: P,
         write_sema: Arc<Semaphore>,
     ) -> Result<Self, SplitPoolCreateError> {
-        let rw_pool = sqlite_pool::Config::new(path.as_ref())
+        let path = path.into();
+        let rw_pool = sqlite_pool::Config::new(path.clone())
             .max_size(1)
             .create_pool_transform(rusqlite_to_crsqlite_write)?;
 
         debug!("built RW pool");
 
-        let ro_pool = sqlite_pool::Config::new(path.as_ref())
+        let ro_pool = sqlite_pool::Config::new(path.clone())
             .read_only()
             .max_size(20)
             .create_pool_transform(rusqlite_to_crsqlite)?;
         debug!("built RO pool");
 
-        Ok(Self::new(
-            path.as_ref().to_owned(),
-            write_sema,
-            ro_pool,
-            rw_pool,
-        ))
+        Ok(Self::new(path, write_sema, ro_pool, rw_pool))
+    }
+
+    pub async fn create_in_memory(
+        name: &str,
+        write_sema: Arc<Semaphore>,
+    ) -> Result<Self, SplitPoolCreateError> {
+        Self::create(format!("file:{name}?mode=memory&cache=shared"), write_sema).await
     }
 
     fn new(path: PathBuf, write_sema: Arc<Semaphore>, read: SqlitePool, write: SqlitePool) -> Self {
@@ -1891,5 +1894,58 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_pool_memory() {
+        let pool = super::SplitPool::create_in_memory("testing", Arc::new(Semaphore::new(1)))
+            .await
+            .unwrap();
+
+        let clock = Arc::new(uhlc::HLC::default());
+
+        let mut schema =
+            crate::schema::parse_sql("CREATE TABLE spm (name TEXT NOT NULL PRIMARY KEY, id INT);")
+                .unwrap();
+
+        {
+            let mut conn = pool.write_priority().await.unwrap();
+            setup_conn(&conn).unwrap();
+            migrate(clock, &mut conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::schema::apply_schema(&tx, &Schema::default(), &mut schema).unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let mut conn = pool.write_priority().await.unwrap();
+            let tx = conn.transaction().unwrap();
+            tx.execute_batch(
+                "INSERT INTO spm (name,id) VALUES ('first',1);
+                INSERT INTO spm (name,id) VALUES('first select',345);
+                INSERT INTO spm (name,id) VALUES('second select',345);
+                INSERT INTO spm (name,id) VALUES('last',9999);
+            ",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let conn = pool.read().await.unwrap();
+            let mut prep = conn.prepare("SELECT name FROM spm WHERE id=345").unwrap();
+            let mut rows = prep.query([]).unwrap();
+
+            assert_eq!(
+                rows.next().unwrap().unwrap().get::<_, String>(0).unwrap(),
+                "first select"
+            );
+            assert_eq!(
+                rows.next().unwrap().unwrap().get::<_, String>(0).unwrap(),
+                "second select"
+            );
+
+            assert!(rows.next().unwrap().is_none());
+        }
     }
 }
