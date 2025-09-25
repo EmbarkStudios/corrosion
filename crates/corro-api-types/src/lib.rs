@@ -254,9 +254,10 @@ pub struct ExecResponse {
 
 /// Result of executing a single statement.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(tag = "ty")]
 pub enum ExecResult {
     /// The statement executed successfully.
+    #[serde(rename = "x")]
     Execute {
         /// Number of rows affected by the statement.
         rows_affected: usize,
@@ -264,6 +265,7 @@ pub enum ExecResult {
         time: f64,
     },
     /// The statement failed; the server returned an error message.
+    #[serde(rename = "e")]
     Error { error: String },
 }
 
