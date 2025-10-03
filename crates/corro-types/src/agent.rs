@@ -555,6 +555,11 @@ impl SplitPool {
         gauge!("corro.sqlite.write.permits.available").set(available_permit as f64);
     }
 
+    #[inline]
+    pub fn path(&self) -> &std::path::Path {
+        &self.0.path
+    }
+
     // get a read-only connection
     #[tracing::instrument(skip(self), level = "debug")]
     pub async fn read(&self) -> Result<sqlite_pool::Connection<CrConn>, SqlitePoolError> {
