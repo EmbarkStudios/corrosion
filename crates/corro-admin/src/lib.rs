@@ -515,7 +515,7 @@ async fn handle_conn(
                                 Response::Json(serde_json::json!({
                                     "id": matcher.id(),
                                     "hash": matcher.hash(),
-                                    "path": matcher.subs_path(),
+                                    //"path": matcher.subs_path(),
                                     "last_change_id": matcher.last_change_id_sent(),
                                     "original_query": matcher.sql().lines().map(|c| c.trim()).collect::<Vec<_>>().join(" "),
                                     "statements": statements,

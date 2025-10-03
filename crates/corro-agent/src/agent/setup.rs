@@ -308,7 +308,7 @@ async fn setup_spawn_subscriptions(
                 if let Ok(sub_id) = sub_id_str.trim_matches('/').parse() {
                     let (_, created) = match subs_manager.restore(
                         sub_id,
-                        &subs_path,
+                        Some(&subs_path),
                         schema,
                         pool,
                         tripwire.clone(),
@@ -340,7 +340,7 @@ async fn setup_spawn_subscriptions(
 
     for id in to_cleanup {
         info!(sub_id = %id, "Cleaning up unclean subscription");
-        Matcher::cleanup(id, Matcher::sub_path(subs_path.as_path(), id))?;
+        Matcher::cleanup(id, &Matcher::sub_path(subs_path.as_path(), id))?;
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
