@@ -695,7 +695,7 @@ pub async fn api_v1_subs(
 
     let upsert_res = subs.get_or_insert(
         &stmt,
-        &agent.config().db.subscriptions_path(),
+        Some(&agent.config().db.subscriptions_path()),
         &agent.schema().read(),
         agent.pool(),
         tripwire.clone(),

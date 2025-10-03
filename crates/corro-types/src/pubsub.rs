@@ -117,7 +117,7 @@ impl SubsManager {
     pub fn get_or_insert(
         &self,
         sql: &str,
-        subs_path: &Utf8Path,
+        subs_path: Option<&Utf8Path>,
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
@@ -136,7 +136,7 @@ impl SubsManager {
 
         let handle_res = Matcher::create(
             id,
-            subs_path.to_path_buf(),
+            subs_path,
             schema,
             pool.client_dedicated()?,
             evt_tx,
@@ -148,8 +148,11 @@ impl SubsManager {
             Ok(handle) => handle,
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
-                if let Err(e) = Matcher::cleanup(id, Matcher::sub_path(subs_path, id)) {
-                    error!("could not cleanup subscription: {e}");
+
+                if let Some(sp) = subs_path {
+                    if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(sp, id)) {
+                        error!("could not cleanup subscription: {e}");
+                    }
                 }
 
                 return Err(e);
@@ -166,7 +169,7 @@ impl SubsManager {
     pub fn restore(
         &self,
         id: Uuid,
-        subs_path: &Utf8Path,
+        subs_path: Option<&Utf8Path>,
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
@@ -181,7 +184,7 @@ impl SubsManager {
 
         let handle = Matcher::restore(
             id,
-            subs_path.to_path_buf(),
+            subs_path,
             schema,
             pool.client_dedicated()?,
             evt_tx,
@@ -275,7 +278,7 @@ struct InnerMatcherHandle {
     last_change_rx: watch::Receiver<ChangeId>,
     purge_tx: mpsc::Sender<oneshot::Sender<rusqlite::Result<usize>>>,
     // some state from the matcher so we can take a look later
-    subs_path: String,
+    //subs_path: String,
     cached_statements: HashMap<String, MatcherStmt>,
     metrics: HashMap<String, HandleMetrics>,
     /// EMA of ms/s spent in handle_candidates
@@ -414,9 +417,9 @@ impl MatcherHandle {
         &self.inner.col_names
     }
 
-    pub fn subs_path(&self) -> &String {
-        &self.inner.subs_path
-    }
+    // pub fn subs_path(&self) -> &String {
+    //     &self.inner.subs_path
+    // }
 
     pub fn cached_stmts(&self) -> &HashMap<String, MatcherStmt> {
         &self.inner.cached_statements
@@ -595,6 +598,52 @@ impl MatcherHandle {
 
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 
+enum DbName {
+    Path(Utf8PathBuf),
+    Memory(String),
+}
+
+impl DbName {
+    fn new(id: Uuid, path: Option<&Utf8Path>) -> Self {
+        if let Some(p) = path {
+            let mut pb = Utf8PathBuf::with_capacity(p.as_str().len() + 36 + SUB_DB_PATH.len() + 2);
+            pb.push(p);
+            pb.push(id.to_string());
+            pb.push(SUB_DB_PATH);
+
+            Self::Path(pb)
+        } else {
+            Self::Memory(format!("file:{id}?mode=memory&cache=shared"))
+        }
+    }
+
+    #[inline]
+    fn create(&self) -> std::io::Result<()> {
+        if let Self::Path(p) = self {
+            std::fs::create_dir_all(p.parent().unwrap())?;
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Path(p) => p.as_str(),
+            Self::Memory(m) => m.as_str(),
+        }
+    }
+}
+
+impl AsRef<std::path::Path> for DbName {
+    fn as_ref(&self) -> &std::path::Path {
+        match self {
+            Self::Path(p) => p.as_std_path(),
+            Self::Memory(m) => m.as_ref(),
+        }
+    }
+}
+
 pub struct Matcher {
     pub id: Uuid,
     pub hash: String,
@@ -606,7 +655,7 @@ pub struct Matcher {
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
     conn: Connection,
-    base_path: Utf8PathBuf,
+    db_name: DbName,
     cancel: CancellationToken,
     state: StateLock,
     last_change_tx: watch::Sender<ChangeId>,
@@ -637,20 +686,13 @@ pub const SUB_DB_PATH: &str = "sub.sqlite";
 impl Matcher {
     fn new(
         id: Uuid,
-        subs_path: &Utf8PathBuf,
+        db_name: DbName,
         schema: &Schema,
         state_conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
-    ) -> Result<(Matcher, MatcherHandle), MatcherError> {
-        let sub_path = Self::sub_path(subs_path.as_path(), id);
+    ) -> Result<(Self, MatcherHandle), MatcherError> {
         let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
-
-        info!(%sql_hash, sub_id = %id, "Initializing subscription at {sub_path}");
-
-        std::fs::create_dir_all(&sub_path)?;
-
-        let sub_db_path = sub_path.join(SUB_DB_PATH);
 
         let col_names: Vec<ColumnName> = {
             state_conn
@@ -661,7 +703,7 @@ impl Matcher {
                 .collect()
         };
 
-        let conn = Connection::open(&sub_db_path)?;
+        let conn = Connection::open(db_name.as_ref())?;
         trace_heavy_queries_subs(&conn)?;
         conn.execute_batch(
             r#"
@@ -857,7 +899,7 @@ impl Matcher {
                 id,
                 sql: sql.to_owned(),
                 hash: sql_hash.clone(),
-                pool: sqlite_pool::Config::new(sub_db_path.into_std_path_buf())
+                pool: sqlite_pool::Config::new(db_name.as_ref().to_owned())
                     .max_size(5)
                     .read_only()
                     .create_pool()
@@ -869,7 +911,7 @@ impl Matcher {
                 changes_tx,
                 purge_tx,
                 cached_statements: statements.clone(),
-                subs_path: sub_path.to_string(),
+                //subs_path: sub_path.to_string(),
                 metrics: counter_map,
                 processing_stats: Arc::new(Mutex::new(ProcessingStats {
                     ema_ms_per_sec: 0.0,
@@ -892,7 +934,7 @@ impl Matcher {
             col_names,
             last_rowid: 0,
             conn,
-            base_path: sub_path,
+            db_name,
             cancel,
             state,
             last_change_tx,
@@ -904,16 +946,25 @@ impl Matcher {
         Ok((matcher, handle))
     }
 
-    pub fn cleanup(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
+    pub fn cleanup(id: Uuid, sub_path: &Utf8Path) -> rusqlite::Result<()> {
         info!(sub_id = %id, "Attempting to cleanup... {}", sub_path);
 
         block_in_place(|| {
-            if let Err(e) = std::fs::remove_dir_all(&sub_path) {
+            if let Err(e) = std::fs::remove_dir_all(sub_path) {
                 error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
             }
 
             Ok(())
         })
+    }
+
+    #[inline]
+    fn remove_db_dir(&self) -> rusqlite::Result<()> {
+        let DbName::Path(p) = &self.db_name else {
+            return Ok(());
+        };
+
+        Self::cleanup(self.id, p.parent().unwrap())
     }
 
     pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
@@ -940,14 +991,16 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: Uuid,
-        subs_path: Utf8PathBuf,
+        subs_path: Option<&Utf8Path>,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
+        let db_name = DbName::new(id, subs_path);
+
         let sql: String = block_in_place(|| {
-            let conn = Connection::open(Matcher::sub_db_path(&subs_path, id))?;
+            let conn = Connection::open(db_name.as_ref())?;
             let state: Option<String> = conn
                 .query_row("SELECT value FROM meta WHERE key = 'state'", [], |row| {
                     row.get(0)
@@ -969,7 +1022,7 @@ impl Matcher {
             }
         })?;
 
-        let (matcher, handle) = Self::new(id, &subs_path, schema, &state_conn, evt_tx, &sql)?;
+        let (matcher, handle) = Self::new(id, db_name, schema, &state_conn, evt_tx, &sql)?;
 
         spawn_counted(async move {
             if let Err(e) = matcher.run_restore(state_conn, tripwire).await {
@@ -986,14 +1039,15 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         id: Uuid,
-        subs_path: Utf8PathBuf,
+        subs_path: Option<&Utf8Path>,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         tripwire: Tripwire,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) = Self::new(id, &subs_path, schema, &state_conn, evt_tx, sql)?;
+        let db_name = DbName::new(id, subs_path);
+        let (mut matcher, handle) = Self::new(id, db_name, schema, &state_conn, evt_tx, sql)?;
 
         let pk_cols = matcher
             .pks
@@ -1152,7 +1206,7 @@ impl Matcher {
         info!(sub_id = %self.id, "Attaching __corro_sub to state db");
         if let Err(e) = state_conn.execute_batch(&format!(
             "ATTACH DATABASE {} AS __corro_sub",
-            enquote::enquote('\'', self.base_path.join(SUB_DB_PATH).as_str()),
+            enquote::enquote('\'', self.db_name.as_str()),
         )) {
             error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
             _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
@@ -1221,7 +1275,7 @@ impl Matcher {
                         error!(sub_id = %self.id, "could not set status during cancellation: {e}");
                     }
                     info!(sub_id = %self.id, "attempting to cleanup");
-                    if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                    if let Err(e) = self.remove_db_dir() {
                         error!("could not handle cleanup: {e}");
                     }
                     return;
@@ -1274,7 +1328,7 @@ impl Matcher {
                             error!(sub_id = %self.id, "could not handle change: {e}");
                         }
                         info!(sub_id = %self.id, "attempting to cleanup");
-                        if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                        if let Err(e) = self.remove_db_dir() {
                             error!("could not handle cleanup: {e}");
                         }
                         return;
@@ -1333,7 +1387,7 @@ impl Matcher {
             let start = Instant::now();
             if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf, true)) {
                 error!(sub_id = %self.id, "could not handle final buffered candidates: {e}");
-                if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                if let Err(e) = self.remove_db_dir() {
                     error!(sub_id = %self.id, "could not handle cleanup: {e}");
                 }
                 return;
@@ -2600,7 +2654,7 @@ mod tests {
         {
             let (handle, maybe_created) = subs.get_or_insert(
                 sql,
-                subscriptions_path.as_path(),
+                Some(subscriptions_path.as_path()),
                 &schema,
                 &pool,
                 tripwire.clone(),
@@ -2811,7 +2865,7 @@ mod tests {
             let (matcher, maybe_created) = subs
                 .get_or_insert(
                     sql,
-                    subscriptions_path.as_path(),
+                    Some(subscriptions_path.as_path()),
                     &schema,
                     &pool,
                     tripwire.clone(),
@@ -3013,7 +3067,13 @@ mod tests {
         // restore subscription
         let matcher_id = {
             let (matcher, created) = subs
-                .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
+                .restore(
+                    id,
+                    Some(&subscriptions_path),
+                    &schema,
+                    &pool,
+                    tripwire.clone(),
+                )
                 .unwrap();
             let mut rx = created.evt_rx;
 
@@ -3156,7 +3216,13 @@ mod tests {
 
         // a restore should start ok if we shutdown properly
         {
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                Some(&subscriptions_path),
+                &schema,
+                &pool,
+                tripwire.clone(),
+            );
             assert!(res.is_ok());
         }
 
@@ -3171,7 +3237,13 @@ mod tests {
             )
             .unwrap();
 
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                Some(&subscriptions_path),
+                &schema,
+                &pool,
+                tripwire.clone(),
+            );
             assert!(res.is_err());
         }
     }
