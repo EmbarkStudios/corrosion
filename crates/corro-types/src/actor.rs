@@ -139,7 +139,7 @@ pub struct Actor {
     #[serde(default)]
     cluster_id: ClusterId,
     #[serde(default)]
-    member_id: Option<MemberId>,
+    membership_id: Option<MembershipId>,
 }
 
 impl Hash for Actor {
@@ -155,14 +155,14 @@ impl Actor {
         addr: SocketAddr,
         ts: Timestamp,
         cluster_id: ClusterId,
-        member_id: Option<MemberId>,
+        membership_id: Option<MembershipId>,
     ) -> Self {
         Self {
             id,
             addr,
             ts,
             cluster_id,
-            member_id,
+            membership_id,
         }
     }
 
@@ -178,12 +178,12 @@ impl Actor {
     pub fn cluster_id(&self) -> ClusterId {
         self.cluster_id
     }
-    pub fn member_id(&self) -> Option<MemberId> {
-        self.member_id
+    pub fn membership_id(&self) -> Option<MembershipId> {
+        self.membership_id
     }
 
     pub fn to_state(&self) -> MemberState {
-        MemberState::new(self.addr, self.ts, self.cluster_id, self.member_id)
+        MemberState::new(self.addr, self.ts, self.cluster_id)
     }
 }
 
@@ -239,7 +239,7 @@ impl Identity for Actor {
             addr: self.addr,
             ts: NTP64::from(duration_since_epoch()).into(),
             cluster_id: self.cluster_id,
-            member_id: self.member_id,
+            membership_id: self.membership_id,
         })
     }
 
@@ -312,21 +312,21 @@ impl FromSql for ClusterId {
     Debug, Default, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
 )]
 #[serde(transparent)]
-pub struct MemberId(pub u16);
+pub struct MembershipId(pub u16);
 
-impl fmt::Display for MemberId {
+impl fmt::Display for MembershipId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl<'a, C> Readable<'a, C> for MemberId
+impl<'a, C> Readable<'a, C> for MembershipId
 where
     C: Context,
 {
     #[inline]
     fn read_from<R: Reader<'a, C>>(reader: &mut R) -> Result<Self, C::Error> {
-        Ok(MemberId(u16::read_from(reader)?))
+        Ok(MembershipId(u16::read_from(reader)?))
     }
 
     #[inline]
@@ -335,7 +335,7 @@ where
     }
 }
 
-impl<C> Writable<C> for MemberId
+impl<C> Writable<C> for MembershipId
 where
     C: Context,
 {
@@ -350,13 +350,13 @@ where
     }
 }
 
-impl ToSql for MemberId {
+impl ToSql for MembershipId {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         self.0.to_sql()
     }
 }
 
-impl FromSql for MemberId {
+impl FromSql for MembershipId {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         Ok(Self(FromSql::column_result(value)?))
     }
