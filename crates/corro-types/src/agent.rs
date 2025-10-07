@@ -156,17 +156,17 @@ impl Agent {
         }))
     }
 
-    pub fn actor<C: Into<Option<ClusterId>>, M: Into<Option<MemberId>>>(
+    pub fn actor<C: Into<Option<ClusterId>>, M: Into<Option<MembershipId>>>(
         &self,
         cluster_id: C,
-        member_id: M,
+        membership_id: M,
     ) -> Actor {
         Actor::new(
             self.0.actor_id,
             self.external_addr().unwrap_or_else(|| self.gossip_addr()),
             self.clock().new_timestamp().into(),
             cluster_id.into().unwrap_or_else(|| self.cluster_id()),
-            member_id.into(),
+            membership_id.into(),
         )
     }
 
@@ -292,8 +292,8 @@ impl Agent {
         *self.0.cluster_id.load().as_ref()
     }
 
-    pub fn member_id(&self) -> Option<MemberId> {
-        self.0.config.load().gossip.member_id
+    pub fn membership_id(&self) -> Option<MembershipId> {
+        self.0.config.load().gossip.membership_id
     }
 
     pub fn update_clock_with_timestamp(

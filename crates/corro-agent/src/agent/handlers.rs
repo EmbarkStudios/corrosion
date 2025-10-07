@@ -334,6 +334,12 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             OwnedNotification::MemberUp(actor) => {
+                if actor.membership_id() != agent.config().gossip.membership_id {
+                    let removed = { agent.members().write().remove_member(&actor) };
+                    info!("Member Up but different membership id {actor:?} (removed: {removed})");
+                    continue;
+                }
+
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 

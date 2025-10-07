@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 
-use crate::actor::MemberId;
+use crate::actor::MembershipId;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
@@ -384,7 +384,7 @@ pub struct GossipConfig {
     #[serde(default)]
     pub disable_gso: bool,
     #[serde(default)]
-    pub member_id: Option<MemberId>,
+    pub membership_id: Option<MembershipId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,8 +639,8 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn member_id(mut self, member_id: MemberId) -> Self {
-        self.member_id = Some(member_id);
+    pub fn membership_id(mut self, membership_id: MembershipId) -> Self {
+        self.membership_id = Some(membership_id);
         self
     }
 
