@@ -606,9 +606,9 @@ enum DbName {
 impl DbName {
     fn new(id: Uuid, path: Option<&Utf8Path>) -> Self {
         if let Some(p) = path {
-            let mut pb = Utf8PathBuf::with_capacity(p.as_str().len() + 36 + SUB_DB_PATH.len() + 2);
+            let mut pb = Utf8PathBuf::with_capacity(p.as_str().len() + 32 + SUB_DB_PATH.len() + 2);
             pb.push(p);
-            pb.push(id.to_string());
+            pb.push(id.as_simple().to_string());
             pb.push(SUB_DB_PATH);
 
             Self::Path(pb)
