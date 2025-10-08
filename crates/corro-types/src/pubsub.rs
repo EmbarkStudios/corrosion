@@ -613,7 +613,7 @@ impl DbName {
 
             Self::Path(pb)
         } else {
-            Self::Memory(format!("file:{id}?mode=memory"))
+            Self::Memory(format!("file:{}?mode=memory&cache=shared", id.as_simple()))
         }
     }
 
