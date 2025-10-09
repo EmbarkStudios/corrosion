@@ -308,7 +308,7 @@ async fn setup_spawn_subscriptions(
                 if let Ok(sub_id) = sub_id_str.trim_matches('/').parse() {
                     let (_, created) = match subs_manager.restore(
                         sub_id,
-                        Some(&subs_path),
+                        &subs_path,
                         schema,
                         pool,
                         tripwire.clone(),
