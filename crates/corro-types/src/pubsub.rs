@@ -117,7 +117,7 @@ impl SubsManager {
     pub fn get_or_insert(
         &self,
         sql: &str,
-        subs_path: Option<&Utf8Path>,
+        subs_path: &Utf8Path,
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
@@ -149,10 +149,8 @@ impl SubsManager {
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
 
-                if let Some(sp) = subs_path {
-                    if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(sp, id)) {
-                        error!("could not cleanup subscription: {e}");
-                    }
+                if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(subs_path, id)) {
+                    error!("could not cleanup subscription: {e}");
                 }
 
                 return Err(e);
@@ -169,7 +167,7 @@ impl SubsManager {
     pub fn restore(
         &self,
         id: Uuid,
-        subs_path: Option<&Utf8Path>,
+        subs_path: &Utf8Path,
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
@@ -598,49 +596,33 @@ impl MatcherHandle {
 
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
 
-enum DbName {
-    Path(Utf8PathBuf),
-    Memory(String),
-}
+struct DbName(Utf8PathBuf);
 
 impl DbName {
-    fn new(id: Uuid, path: Option<&Utf8Path>) -> Self {
-        if let Some(p) = path {
-            let mut pb = Utf8PathBuf::with_capacity(p.as_str().len() + 32 + SUB_DB_PATH.len() + 2);
-            pb.push(p);
-            pb.push(id.as_simple().to_string());
-            pb.push(SUB_DB_PATH);
+    #[inline]
+    fn new(id: Uuid, path: &Utf8Path) -> Self {
+        let mut pb = Utf8PathBuf::with_capacity(path.as_str().len() + 32 + SUB_DB_PATH.len() + 2);
+        pb.push(path);
+        pb.push(id.as_simple().to_string());
+        pb.push(SUB_DB_PATH);
 
-            Self::Path(pb)
-        } else {
-            Self::Memory(format!("file:{}?mode=memory&cache=shared", id.as_simple()))
-        }
+        Self(pb)
     }
 
     #[inline]
     fn create(&self) -> std::io::Result<()> {
-        if let Self::Path(p) = self {
-            std::fs::create_dir_all(p.parent().unwrap())?;
-        }
-
-        Ok(())
+        std::fs::create_dir_all(self.0.parent().unwrap())
     }
 
     #[inline]
     fn as_str(&self) -> &str {
-        match self {
-            Self::Path(p) => p.as_str(),
-            Self::Memory(m) => m.as_str(),
-        }
+        self.0.as_str()
     }
 }
 
 impl AsRef<std::path::Path> for DbName {
     fn as_ref(&self) -> &std::path::Path {
-        match self {
-            Self::Path(p) => p.as_std_path(),
-            Self::Memory(m) => m.as_ref(),
-        }
+        self.0.as_std_path()
     }
 }
 
@@ -960,11 +942,7 @@ impl Matcher {
 
     #[inline]
     fn remove_db_dir(&self) -> rusqlite::Result<()> {
-        let DbName::Path(p) = &self.db_name else {
-            return Ok(());
-        };
-
-        Self::cleanup(self.id, p.parent().unwrap())
+        Self::cleanup(self.id, self.db_name.0.parent().unwrap())
     }
 
     pub fn sub_path(subs_path: &Utf8Path, id: Uuid) -> Utf8PathBuf {
@@ -991,7 +969,7 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: Uuid,
-        subs_path: Option<&Utf8Path>,
+        subs_path: &Utf8Path,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
@@ -1039,7 +1017,7 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         id: Uuid,
-        subs_path: Option<&Utf8Path>,
+        subs_path: &Utf8Path,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
@@ -2654,7 +2632,7 @@ mod tests {
         {
             let (handle, maybe_created) = subs.get_or_insert(
                 sql,
-                Some(subscriptions_path.as_path()),
+                subscriptions_path.as_path(),
                 &schema,
                 &pool,
                 tripwire.clone(),
@@ -2865,7 +2843,7 @@ mod tests {
             let (matcher, maybe_created) = subs
                 .get_or_insert(
                     sql,
-                    Some(subscriptions_path.as_path()),
+                    subscriptions_path.as_path(),
                     &schema,
                     &pool,
                     tripwire.clone(),
@@ -3067,13 +3045,7 @@ mod tests {
         // restore subscription
         let matcher_id = {
             let (matcher, created) = subs
-                .restore(
-                    id,
-                    Some(&subscriptions_path),
-                    &schema,
-                    &pool,
-                    tripwire.clone(),
-                )
+                .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
                 .unwrap();
             let mut rx = created.evt_rx;
 
@@ -3216,13 +3188,7 @@ mod tests {
 
         // a restore should start ok if we shutdown properly
         {
-            let res = subs.restore(
-                id,
-                Some(&subscriptions_path),
-                &schema,
-                &pool,
-                tripwire.clone(),
-            );
+            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
             assert!(res.is_ok());
         }
 
@@ -3237,13 +3203,7 @@ mod tests {
             )
             .unwrap();
 
-            let res = subs.restore(
-                id,
-                Some(&subscriptions_path),
-                &schema,
-                &pool,
-                tripwire.clone(),
-            );
+            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
             assert!(res.is_err());
         }
     }
