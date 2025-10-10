@@ -17,11 +17,7 @@ pub mod util;
 #[cfg(test)]
 mod tests;
 
-use bytes::Bytes;
-use corro_types::api::QueryEventMeta;
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::{broadcast::Sender, RwLock};
-use uuid::Uuid;
+use std::time::Duration;
 
 // Public exports
 pub use error::{SyncClientError, SyncRecvError};
@@ -36,7 +32,7 @@ pub const RANDOM_NODES_CHOICES: usize = 10;
 pub const CHECK_EMPTIES_TO_INSERT_AFTER: Duration = Duration::from_secs(120);
 pub const TO_CLEAR_COUNT: usize = 1000;
 
-pub type BcastCache = Arc<RwLock<HashMap<Uuid, Sender<(Bytes, QueryEventMeta)>>>>;
+pub type BcastCache = crate::api::public::pubsub::SharedMatcherBroadcastCache;
 
 #[derive(Clone)]
 pub struct CountedExecutor;
