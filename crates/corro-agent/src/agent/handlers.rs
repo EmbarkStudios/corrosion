@@ -331,24 +331,13 @@ pub async fn handle_notifications(
         trace!("handle notification");
         match notification {
             OwnedNotification::MemberUp(actor) => {
-                if actor.membership_id() != agent.config().gossip.membership_id {
-                    let removed = { agent.members().write().remove_member(&actor) };
-                    info!("Member Up but different membership id {actor:?} (removed: {removed})");
-                    continue;
-                }
-
                 let member_added_res = agent.members().write().add_member(&actor);
                 info!("Member Up {actor:?} (result: {member_added_res:?})");
 
                 match member_added_res {
                     MemberAddedResult::NewMember | MemberAddedResult::Removed => {
-                        if matches!(member_added_res, MemberAddedResult::Removed) {
-                            debug!("Member Removed {actor:?} due to member id mismatch");
-                            counter!("corro.gossip.member.removed", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
-                        } else {
-                            debug!("Member Added {actor:?}");
-                            counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
-                        }
+                        debug!("Member Added {actor:?}");
+                        counter!("corro.gossip.member.added", "id" => actor.id().0.to_string(), "addr" => actor.addr().to_string()).increment(1);
 
                         let members_len = { agent.members().read().states.len() as u32 };
 
