@@ -1300,12 +1300,12 @@ impl Matcher {
                         }
                     }
 
-                    if buf_count >= PROCESS_CHANGES_THRESHOLD {
+                    //if buf_count >= PROCESS_CHANGES_THRESHOLD {
                         buf_count = 0;
                         Branch::NewCandidates(std::mem::take(&mut buf))
-                    } else {
-                        continue;
-                    }
+                    // } else {
+                    //     continue;
+                    // }
                 },
                 _ = process_changes_deadline.as_mut() => {
                     process_changes_deadline
