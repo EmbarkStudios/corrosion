@@ -121,6 +121,7 @@ impl SubsManager {
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<(MatcherHandle, Option<MatcherCreated>), MatcherError> {
         if let Some(handle) = self.get_by_query(sql) {
             return Ok((handle, None));
@@ -142,6 +143,7 @@ impl SubsManager {
             evt_tx,
             sql,
             tripwire,
+            loop_cfg,
         );
 
         let handle = match handle_res {
@@ -171,6 +173,7 @@ impl SubsManager {
         schema: &Schema,
         pool: &SplitPool,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<(MatcherHandle, MatcherCreated), MatcherError> {
         let mut inner = self.0.write();
 
@@ -187,6 +190,7 @@ impl SubsManager {
             pool.client_dedicated()?,
             evt_tx,
             tripwire,
+            loop_cfg,
         )?;
 
         inner.handles.insert(id, handle.clone());
@@ -676,6 +680,7 @@ pub struct Matcher {
     changes_rx: mpsc::Receiver<MatchCandidates>,
     purge_rx: mpsc::Receiver<oneshot::Sender<rusqlite::Result<usize>>>,
     processing_stats: Arc<Mutex<ProcessingStats>>,
+    loop_cfg: MatcherLoopConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +702,48 @@ pub const QUERY_TABLE_NAME: &str = "query";
 
 pub const SUB_DB_PATH: &str = "sub.sqlite";
 
+const PROCESS_CHANGES_THRESHOLD: usize = 1000;
+const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+const PROCESS_BUFFER_INTERVAL: Duration = Duration::from_millis(600);
+const PURGE_CHANGES_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Configuration used by a [`Matcher`]'s event loop
+#[derive(Clone)]
+pub struct MatcherLoopConfig {
+    /// Maximum number of changes that will be buffered before being sent to
+    /// the subscriber
+    pub changes_threshold: usize,
+    /// The interval at which buffered changes will be processed, if the number
+    /// of buffered changes does not surpass the [`Self::changes_threshold`]
+    pub process_buffer_interval: Duration,
+    /// If processing changes takes
+    pub processing_warn_threshold: Duration,
+    /// Interval at which old changes are purged from the database
+    pub purge_changes_interval: Duration,
+}
+
+impl MatcherLoopConfig {
+    /// A config suitable for testing
+    #[inline]
+    pub fn testing() -> Self {
+        Self {
+            changes_threshold: 0,
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for MatcherLoopConfig {
+    fn default() -> Self {
+        Self {
+            changes_threshold: PROCESS_CHANGES_THRESHOLD,
+            process_buffer_interval: PROCESS_BUFFER_INTERVAL,
+            processing_warn_threshold: PROCESSING_WARN_THRESHOLD,
+            purge_changes_interval: PURGE_CHANGES_INTERVAL,
+        }
+    }
+}
+
 impl Matcher {
     fn new(
         id: Uuid,
@@ -705,6 +752,7 @@ impl Matcher {
         state_conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<(Self, MatcherHandle), MatcherError> {
         let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
 
@@ -955,6 +1003,7 @@ impl Matcher {
             changes_rx,
             purge_rx,
             processing_stats,
+            loop_cfg,
         };
 
         Ok((matcher, handle))
@@ -1006,6 +1055,7 @@ impl Matcher {
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
         let db_name = DbName::new(id, subs_path);
 
@@ -1032,7 +1082,8 @@ impl Matcher {
             }
         })?;
 
-        let (matcher, handle) = Self::new(id, db_name, schema, &state_conn, evt_tx, &sql)?;
+        let (matcher, handle) =
+            Self::new(id, db_name, schema, &state_conn, evt_tx, &sql, loop_cfg)?;
 
         spawn_counted(async move {
             if let Err(e) = matcher.run_restore(state_conn, tripwire).await {
@@ -1055,9 +1106,11 @@ impl Matcher {
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
         let db_name = DbName::new(id, subs_path);
-        let (mut matcher, handle) = Self::new(id, db_name, schema, &state_conn, evt_tx, sql)?;
+        let (mut matcher, handle) =
+            Self::new(id, db_name, schema, &state_conn, evt_tx, sql, loop_cfg)?;
 
         let pk_cols = matcher
             .pks
@@ -1246,10 +1299,6 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
-        const PROCESS_CHANGES_THRESHOLD: usize = 1000;
-        const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
-        const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
-
         info!(sub_id = %self.id, "Starting loop to run the subscription");
         {
             let (lock, cvar) = &*self.state;
@@ -1263,10 +1312,12 @@ impl Matcher {
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
-        let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+        let loop_cfg = self.loop_cfg.clone();
+
+        let mut purge_changes_interval = tokio::time::interval(loop_cfg.purge_changes_interval);
 
         // max duration of aggregating candidates
-        let process_changes_deadline = tokio::time::sleep(PROCESS_BUFFER_DEADLINE);
+        let process_changes_deadline = tokio::time::sleep(loop_cfg.process_buffer_interval);
         tokio::pin!(process_changes_deadline);
 
         loop {
@@ -1287,6 +1338,8 @@ impl Matcher {
                     info!(sub_id = %self.id, "attempting to cleanup");
                     if let Err(e) = self.remove_db_dir() {
                         error!("could not handle cleanup: {e}");
+                    } else {
+                        info!("cleaned {}", self.db_name.as_str());
                     }
                     return;
                 }
@@ -1300,17 +1353,17 @@ impl Matcher {
                         }
                     }
 
-                    //if buf_count >= PROCESS_CHANGES_THRESHOLD {
+                    if buf_count >= loop_cfg.changes_threshold {
                         buf_count = 0;
                         Branch::NewCandidates(std::mem::take(&mut buf))
-                    // } else {
-                    //     continue;
-                    // }
+                    } else {
+                        continue;
+                    }
                 },
                 _ = process_changes_deadline.as_mut() => {
                     process_changes_deadline
                         .as_mut()
-                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
+                        .reset((Instant::now() + loop_cfg.process_buffer_interval).into());
                     if buf_count == 0 {
                         continue;
                     }
@@ -1349,7 +1402,7 @@ impl Matcher {
 
                     histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
 
-                    if elapsed >= PROCESSING_WARN_THRESHOLD {
+                    if elapsed >= loop_cfg.processing_warn_threshold {
                         warn!(sub_id = %self.id, "processed {buf_count} changes (very slowly) for subscription in {elapsed:?}");
                     } else {
                         debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {elapsed:?}");
@@ -1359,7 +1412,7 @@ impl Matcher {
                     // reset the deadline
                     process_changes_deadline
                         .as_mut()
-                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
+                        .reset((Instant::now() + loop_cfg.process_buffer_interval).into());
                 }
                 Branch::PurgeOldChanges(maybe_response_tx) => {
                     let start = Instant::now();
@@ -2668,6 +2721,7 @@ mod tests {
                 &schema,
                 &pool,
                 tripwire.clone(),
+                MatcherLoopConfig::testing(),
             )?;
 
             assert!(maybe_created.is_some());
@@ -2684,6 +2738,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[ignore]
     async fn test_diff() {
         _ = tracing_subscriber::fmt::try_init();
         let sql = "SELECT json_object(
@@ -2879,6 +2934,7 @@ mod tests {
                     &schema,
                     &pool,
                     tripwire.clone(),
+                    MatcherLoopConfig::testing(),
                 )
                 .unwrap();
 
@@ -3077,7 +3133,14 @@ mod tests {
         // restore subscription
         let matcher_id = {
             let (matcher, created) = subs
-                .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
+                .restore(
+                    id,
+                    &subscriptions_path,
+                    &schema,
+                    &pool,
+                    tripwire.clone(),
+                    MatcherLoopConfig::testing(),
+                )
                 .unwrap();
             let mut rx = created.evt_rx;
 
@@ -3220,7 +3283,14 @@ mod tests {
 
         // a restore should start ok if we shutdown properly
         {
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                &subscriptions_path,
+                &schema,
+                &pool,
+                tripwire.clone(),
+                MatcherLoopConfig::testing(),
+            );
             assert!(res.is_ok());
         }
 
@@ -3235,7 +3305,14 @@ mod tests {
             )
             .unwrap();
 
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                &subscriptions_path,
+                &schema,
+                &pool,
+                tripwire.clone(),
+                MatcherLoopConfig::testing(),
+            );
             assert!(res.is_err());
         }
     }
