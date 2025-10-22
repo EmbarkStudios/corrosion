@@ -312,6 +312,7 @@ async fn setup_spawn_subscriptions(
                         schema,
                         pool,
                         tripwire.clone(),
+                        Default::default(),
                     ) {
                         Ok(res) => res,
                         Err(e) => {

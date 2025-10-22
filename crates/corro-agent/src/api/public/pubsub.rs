@@ -707,6 +707,7 @@ pub async fn api_v1_subs(
         &agent.schema().read(),
         agent.pool(),
         tripwire.clone(),
+        Default::default(),
     );
 
     let (handle, maybe_created) = match upsert_res {
