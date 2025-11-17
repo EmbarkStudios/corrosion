@@ -68,13 +68,9 @@ fn handle_query_metrics(elapsed: Duration) {
         }
     }
 
-    let mut other_ro_queries_count = 0u64;
-    let mut other_ro_queries_nanos = 0u128;
-    let mut other_rw_queries_count = 0u64;
-    let mut other_rw_queries_nanos = 0u128;
-    for ((query_raw, readonly), (total_query_count, total_query_nanos)) in aggregated.into_iter() {
-        let total_query_ms = (total_query_nanos / 1_000_000) as u64;
-        let ms_per_second = total_query_ms as f64 / elapsed.as_secs_f64();
+    for ((query_raw, readonly), (total_count, total_nanos)) in aggregated.into_iter() {
+        let total_ms = (total_nanos / 1_000_000) as u64;
+        let ms_per_second = total_ms as f64 / elapsed.as_secs_f64();
         if ms_per_second > IMPACTFUL_QUERY_THRESHOLD_MS_PER_SECOND {
             // For too long queries, truncate them to cap the label length
             // and append a hash to avoid collisions
