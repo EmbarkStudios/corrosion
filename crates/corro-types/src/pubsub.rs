@@ -1,6 +1,7 @@
 use std::{
     cmp,
     collections::{BTreeMap, HashMap, HashSet},
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -539,44 +540,59 @@ impl MatcherHandle {
         Ok(max_change_id)
     }
 
+    #[inline]
     fn make_query(&self, prefix: &str, suffix: &str) -> String {
-        fn col_len(num: usize) -> usize {
-            // SQLite defaults to a maximum of 2000 columns
-            debug_assert!(num <= 2000 && num > 0);
+        let num = self.parsed_columns().len();
+        // SQLite defaults to a maximum of 2000 columns
+        debug_assert!(num <= 2000 && num > 0);
 
-            const fn len_for_count(count: usize, digits: usize) -> usize {
-                count * digits + count * 5
-            }
+        let col_s = ColStr::new(num).unwrap();
 
-            let mut total = 0;
-            for (digits, low, high) in [(1, 0, 10), (2, 10, 100), (3, 100, 1000), (4, 1000, 10000)]
-            {
-                if num < high {
-                    total += len_for_count(num - low, digits);
-                    break;
-                }
-
-                total += len_for_count(high - low, digits);
-            }
-
-            total - 1
-        }
-
-        let cols = self.parsed_columns().len();
-        let mut pq = String::with_capacity(prefix.len() + suffix.len() + col_len(cols));
-        pq.push_str(prefix);
-
-        for i in 0..cols {
-            if i > 0 {
-                pq.push(',');
-            }
-
-            use std::fmt::Write;
-            write!(&mut pq, "col_{i}").unwrap();
-        }
-
-        pq.push_str(suffix);
+        let mut pq = String::with_capacity(prefix.len() + suffix.len() + col_s.string_size());
+        use std::fmt::Write;
+        write!(&mut pq, "{prefix}{col_s}{suffix}").unwrap();
         pq
+    }
+}
+
+struct ColStr(std::num::NonZeroUsize);
+
+impl ColStr {
+    fn new(num_columns: usize) -> Option<Self> {
+        std::num::NonZeroUsize::new(num_columns).map(Self)
+    }
+
+    /// Returns the size of the string needed to contain the columns
+    fn string_size(&self) -> usize {
+        const fn len_for_count(count: usize, digits: usize) -> usize {
+            count * digits + count * 5
+        }
+
+        let num = self.0.get();
+        let mut total = 0;
+        for (digits, low, high) in [(1, 0, 10), (2, 10, 100), (3, 100, 1000), (4, 1000, 10000)] {
+            if num < high {
+                total += len_for_count(num - low, digits);
+                break;
+            }
+
+            total += len_for_count(high - low, digits);
+        }
+
+        total - 1
+    }
+}
+
+impl fmt::Display for ColStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("col_0")?;
+
+        for i in 1..self.0.get() {
+            f.write_str(",")?;
+            write!(f, "col_{i}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1413,10 +1429,29 @@ impl Matcher {
             return;
         }
 
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed.columns.len()) {
-            query_cols.push(format!("col_{i}"));
-        }
+        let Some(col_str) = ColStr::new(self.parsed.columns.len()) else {
+            error!(sub_id = %self.id, "must query at least 1 column");
+            return;
+        };
+
+        let write_all_cols = |s: &mut String| {
+            let mut viter = self.pks.values().flatten();
+            let first = viter.next().expect("at least 1 column");
+            s.push_str(first);
+
+            for col in viter {
+                s.push(',');
+                s.push_str(col);
+            }
+
+            use std::fmt::Write;
+            write!(s, ",{col_str}").unwrap();
+        };
+
+        let (num_all_cols, size_all_cols) = self.pks.values().flatten().fold(
+            (self.parsed.columns.len(), col_str.string_size()),
+            |acc, col| (acc.0 + 1, acc.1 + col.len() + 1),
+        );
 
         let res = block_in_place(|| {
             let tx = self.conn.transaction()?;
@@ -1424,26 +1459,18 @@ impl Matcher {
             let mut stmt_str = Cmd::Stmt(self.query.clone()).to_string();
             stmt_str.pop(); // remove trailing `;`
 
-            let mut all_cols = self
-                .pks
-                .values()
-                .flatten()
-                .cloned()
-                .collect::<Vec<String>>();
-
-            for i in 0..(self.parsed.columns.len()) {
-                let col_name = format!("col_{i}");
-                all_cols.push(col_name.clone());
-            }
-
             let mut last_rowid = 0;
 
             // ensure drop and recreate
-            tx.execute_batch(&format!(
-                "DROP TABLE IF EXISTS state_rows;
-                    CREATE TEMP TABLE state_rows ({})",
-                all_cols.join(",")
-            ))?;
+            {
+                let mut drc = String::with_capacity(64 + size_all_cols);
+                drc.push_str("DROP TABLE IF EXISTS state_rows; CREATE TEMP TABLE state_rows (");
+
+                write_all_cols(&mut drc);
+
+                drc.push(')');
+                tx.execute_batch(&drc)?;
+            }
 
             info!(sub_id = %self.id, "Starting state conn read transaction for initial query");
             // this is read transaction up until the end!
@@ -1461,16 +1488,23 @@ impl Matcher {
                 let elapsed = start.elapsed();
                 info!(sub_id = %self.id, "Initial query done in {elapsed:?}");
 
-                let insert_into = format!(
-                    "INSERT INTO query ({}) VALUES ({}) RETURNING __corro_rowid,{}",
-                    all_cols.join(","),
-                    all_cols
-                        .iter()
-                        .map(|_| "?".to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    query_cols.join(","),
-                );
+                let insert_into = {
+                    let mut ii = String::with_capacity(
+                        19 + size_all_cols + 10 + num_all_cols * 2 + 26 + col_str.string_size(),
+                    );
+                    ii.push_str("INSERT INTO query (");
+                    write_all_cols(&mut ii);
+                    ii.push_str(") VALUES (");
+                    for _ in 0..num_all_cols {
+                        ii.push_str("?,");
+                    }
+                    ii.pop(); // pop trailing ,
+                    ii.push_str(") RETURNING __corro_rowid,");
+                    use std::fmt::Write;
+                    write!(&mut ii, "{col_str}").unwrap();
+                    ii
+                };
+
                 trace!("insert stmt: {insert_into:?}");
 
                 {
@@ -1479,7 +1513,7 @@ impl Matcher {
                     loop {
                         match select_rows.next() {
                             Ok(Some(row)) => {
-                                for i in 0..all_cols.len() {
+                                for i in 0..num_all_cols {
                                     insert.raw_bind_parameter(
                                         i + 1,
                                         SqliteValueRef::from(row.get_ref(i)?),
@@ -1494,7 +1528,7 @@ impl Matcher {
                                 };
 
                                 let rowid = row.get(0)?;
-                                let cells = (1..=query_cols.len())
+                                let cells = (1..=self.parsed.columns.len())
                                     .map(|i| row.get::<_, SqliteValue>(i))
                                     .collect::<rusqlite::Result<Vec<_>>>()?;
 
