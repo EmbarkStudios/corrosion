@@ -12,7 +12,7 @@ pub async fn generate_ca<P: AsRef<Path>>(output_path: P) -> eyre::Result<()> {
 
     let cert_pem = cert.serialize_pem();
     let mut cert_file = tokio::fs::File::create(&cert_path).await?;
-    cert_file.write_all(cert_pem.unwrap().as_bytes()).await?;
+    cert_file.write_all(cert_pem.as_bytes()).await?;
 
     info!("Wrote CA cert to {}", cert_path.display());
 

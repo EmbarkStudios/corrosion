@@ -400,7 +400,7 @@ struct TestCertificates {
 
 async fn generate_and_write_certs(tmpdir: &TempDir) -> TestCertificates {
     let ca_cert = generate_ca().expect("failed to generate CA");
-    let ca_pem = &ca_cert.serialize_pem().expect("failed to serialize CA");
+    let ca_pem = &ca_cert.serialize_pem();
     let (server_cert, server_cert_signed) = generate_server_cert(
         ca_pem,
         &ca_cert.serialize_private_key_pem(),
@@ -428,12 +428,9 @@ async fn generate_and_write_certs(tmpdir: &TempDir) -> TestCertificates {
         .await
         .expect("failed to write server key");
 
-    tokio::fs::write(
-        &ca_file,
-        ca_cert.serialize_pem().expect("failed to serialize CA"),
-    )
-    .await
-    .expect("failed to write CA");
+    tokio::fs::write(&ca_file, ca_cert.serialize_pem())
+        .await
+        .expect("failed to write CA");
 
     tokio::fs::write(&client_cert_file, &client_cert_signed)
         .await
@@ -445,7 +442,7 @@ async fn generate_and_write_certs(tmpdir: &TempDir) -> TestCertificates {
     TestCertificates {
         server_cert_file: cert_file,
         server_key_file: key_file,
-        ca_cert,
+        ca_cert: ca_cert.cert,
         client_cert_signed,
         client_key: client_cert.serialize_private_key_der(),
         ca_file,
@@ -482,7 +479,7 @@ async fn test_pg_ssl() {
         let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
         root_cert_store
             .add(rustls::pki_types::CertificateDer::from_slice(
-                &certs.ca_cert.serialize_der().unwrap(),
+                &certs.ca_cert.der(),
             ))
             .unwrap();
         let config = rustls::ClientConfig::builder()
@@ -545,10 +542,7 @@ async fn test_pg_mtls() {
         let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
         root_cert_store
             .add(rustls::pki_types::CertificateDer::from_slice(
-                &certs
-                    .ca_cert
-                    .serialize_der()
-                    .expect("failed to serialize cert to DER"),
+                &certs.ca_cert.der(),
             ))
             .expect("failed to add root cert");
 

@@ -2381,13 +2381,13 @@ mod tests {
     async fn test_mutual_tls() -> eyre::Result<()> {
         let ca_cert = generate_ca()?;
         let (server_cert, server_cert_signed) = generate_server_cert(
-            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_pem(),
             &ca_cert.serialize_private_key_pem(),
             "127.0.0.1".parse()?,
         )?;
 
         let (client_cert, client_cert_signed) = generate_client_cert(
-            &ca_cert.serialize_pem()?,
+            &ca_cert.serialize_pem(),
             &ca_cert.serialize_private_key_pem(),
         )?;
 
@@ -2404,7 +2404,7 @@ mod tests {
         tokio::fs::write(&cert_file, &server_cert_signed).await?;
         tokio::fs::write(&key_file, server_cert.serialize_private_key_pem()).await?;
 
-        tokio::fs::write(&ca_file, ca_cert.serialize_pem()?).await?;
+        tokio::fs::write(&ca_file, ca_cert.serialize_pem()).await?;
 
         tokio::fs::write(&client_cert_file, &client_cert_signed).await?;
         tokio::fs::write(&client_key_file, client_cert.serialize_private_key_pem()).await?;
