@@ -5,10 +5,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use tokio::{
-    signal::unix::{SignalKind, signal},
-    sync::{mpsc, watch},
-};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, warn};
 
@@ -51,10 +48,18 @@ impl Tripwire {
     }
 
     /// Listen for SIGTERM and SIGINT
+    #[cfg(unix)]
     pub fn new_signals() -> (Self, TripwireWorker<Select<SignalStream, SignalStream>>) {
+        use tokio::signal::unix::{SignalKind, signal};
+
         let sigterms = SignalStream::new(signal(SignalKind::terminate()).unwrap());
         let sigints = SignalStream::new(signal(SignalKind::interrupt()).unwrap());
         Self::new(select(sigterms, sigints))
+    }
+
+    #[cfg(windows)]
+    pub fn new_signals() -> (Self, TripwireWorker<SignalStream>) {
+        Self::new(SignalStream::new())
     }
 
     /// Returns an Arc of the current [TripwireState]
