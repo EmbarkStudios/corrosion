@@ -41,7 +41,7 @@ pub async fn api_v1_sub_by_id(
     Extension(tripwire): Extension<Tripwire>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<SubParams>,
-) -> impl IntoResponse + use<> {
+) -> impl IntoResponse {
     sub_by_id(
         agent.subs_manager().clone(),
         id,
