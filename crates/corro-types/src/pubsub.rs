@@ -1,46 +1,39 @@
 use std::{
     cmp,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use bytes::{Buf, BufMut};
 use camino::{Utf8Path, Utf8PathBuf};
 use compact_str::{ToCompactString, format_compact};
 use corro_api_types::{
     ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
-use enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
 use metrics::{counter, histogram};
-use parking_lot::{Condvar, Mutex, RwLock};
-use rusqlite::{
-    Connection, OptionalExtension, params_from_iter,
-    types::{FromSqlError, ValueRef},
-};
+use parking_lot::{Condvar, Mutex};
+use rusqlite::{Connection, OptionalExtension, params_from_iter, types::ValueRef};
 use spawn::spawn_counted;
-use sqlite_pool::RusqlitePool;
 use sqlite3_parser::{
     ast::{
-        As, Cmd, Expr, FromClause, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, Name,
-        OneSelect, Operator, QualifiedName, ResultColumn, Select, SelectTable, Stmt,
+        As, Cmd, Expr, FromClause, JoinOperator, JoinType, JoinedSelectTable, Name, OneSelect,
+        Operator, QualifiedName, ResultColumn, SelectTable, Stmt,
     },
     lexer::sql::Parser,
 };
 use tokio::{
-    sync::{AcquireError, mpsc, oneshot, watch},
+    sync::{mpsc, oneshot, watch},
     task::block_in_place,
 };
-use tokio_util::sync::{CancellationToken, DropGuard, WaitForCancellationFuture};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{debug, error, info, trace, warn};
 use tripwire::{Outcome, PreemptibleFutureExt, Tripwire};
 use uuid::Uuid;
 
 use crate::{
-    agent::SplitPool,
     api::QueryEvent,
     change::Change,
     schema::{Schema, Table},
@@ -48,156 +41,18 @@ use crate::{
     updates::HandleMetrics,
 };
 
-use crate::updates::{Handle, Manager};
 pub use corro_api_types::sqlite::ChangeType;
 
-#[derive(Debug, Default, Clone)]
-pub struct SubsManager(Arc<RwLock<InnerSubsManager>>);
+mod config;
+mod db;
+mod error;
+mod handle;
+mod manager;
 
-#[derive(Debug, Default)]
-struct InnerSubsManager {
-    handles: BTreeMap<Uuid, MatcherHandle>,
-    queries: HashMap<String, Uuid>,
-}
-
-// tools to bootstrap a new subscriber or notifier
-pub struct MatcherCreated {
-    pub evt_rx: mpsc::Receiver<QueryEvent>,
-}
-
-const SUB_EVENT_CHANNEL_CAP: usize = 512;
-
-impl Manager<MatcherHandle> for SubsManager {
-    fn trait_type(&self) -> String {
-        "subs".to_string()
-    }
-
-    fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
-        self.0.read().get(id)
-    }
-
-    fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
-        let mut inner = self.0.write();
-        inner.remove(id)
-    }
-
-    fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
-        self.0.read().handles.clone()
-    }
-}
-
-impl SubsManager {
-    pub fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
-        self.0.read().get(id)
-    }
-
-    pub fn get_by_query(&self, sql: &str) -> Option<MatcherHandle> {
-        self.0.read().get_by_query(sql)
-    }
-
-    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
-        self.0.read().get_by_hash(hash)
-    }
-
-    pub fn get_handles(&self) -> BTreeMap<Uuid, MatcherHandle> {
-        self.0.read().handles.clone()
-    }
-
-    pub async fn drop_handles(&self) {
-        let handles = {
-            let mut inner = self.0.write();
-            std::mem::take(&mut inner.handles)
-        };
-        for (_, handle) in handles.iter() {
-            handle.cleanup().await;
-        }
-    }
-
-    pub fn get_or_insert(
-        &self,
-        sql: &str,
-        subs_path: &Utf8Path,
-        schema: &Schema,
-        pool: &SplitPool,
-        tripwire: Tripwire,
-    ) -> Result<(MatcherHandle, Option<MatcherCreated>), MatcherError> {
-        if let Some(handle) = self.get_by_query(sql) {
-            return Ok((handle, None));
-        }
-
-        let mut inner = self.0.write();
-        if let Some(handle) = inner.get_by_query(sql) {
-            return Ok((handle, None));
-        }
-
-        let id = Uuid::new_v4();
-        let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
-
-        let handle_res = Matcher::create(
-            id,
-            subs_path.to_path_buf(),
-            schema,
-            pool.client_dedicated()?,
-            evt_tx,
-            sql,
-            tripwire,
-        );
-
-        let handle = match handle_res {
-            Ok(handle) => handle,
-            Err(e) => {
-                error!(sub_id = %id, "could not create subscription: {e}");
-                if let Err(e) = Matcher::cleanup(id, Matcher::sub_path(subs_path, id)) {
-                    error!("could not cleanup subscription: {e}");
-                }
-
-                return Err(e);
-            }
-        };
-
-        inner.handles.insert(id, handle.clone());
-        inner.queries.insert(sql.to_owned(), id);
-
-        Ok((handle, Some(MatcherCreated { evt_rx })))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn restore(
-        &self,
-        id: Uuid,
-        subs_path: &Utf8Path,
-        schema: &Schema,
-        pool: &SplitPool,
-        tripwire: Tripwire,
-    ) -> Result<(MatcherHandle, MatcherCreated), MatcherError> {
-        let mut inner = self.0.write();
-
-        if inner.handles.contains_key(&id) {
-            return Err(MatcherError::CannotRestoreExisting);
-        }
-
-        let (evt_tx, evt_rx) = mpsc::channel(SUB_EVENT_CHANNEL_CAP);
-
-        let handle = Matcher::restore(
-            id,
-            subs_path.to_path_buf(),
-            schema,
-            pool.client_dedicated()?,
-            evt_tx,
-            tripwire,
-        )?;
-
-        inner.handles.insert(id, handle.clone());
-        inner.queries.insert(handle.inner.sql.clone(), id);
-
-        Ok((handle, MatcherCreated { evt_rx }))
-    }
-
-    pub fn remove(&self, id: &Uuid) -> Option<MatcherHandle> {
-        let mut inner = self.0.write();
-        inner.remove(id)
-    }
-}
+pub use config::MatcherLoopConfig;
+pub use error::{MatcherError, UnpackError};
+pub use handle::MatcherHandle;
+pub use manager::{MatcherCreated, SubsManager};
 
 #[derive(Debug)]
 pub struct MatchableChange<'a> {
@@ -218,31 +73,6 @@ impl<'a> From<&'a Change> for MatchableChange<'a> {
     }
 }
 
-impl InnerSubsManager {
-    fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
-        self.handles.get(id).cloned()
-    }
-
-    fn get_by_query(&self, sql: &str) -> Option<MatcherHandle> {
-        self.queries
-            .get(sql)
-            .and_then(|id| self.handles.get(id).cloned())
-    }
-
-    pub fn get_by_hash(&self, hash: &str) -> Option<MatcherHandle> {
-        self.handles
-            .values()
-            .find(|x| x.inner.hash == hash)
-            .cloned()
-    }
-
-    fn remove(&mut self, id: &Uuid) -> Option<MatcherHandle> {
-        let handle = self.handles.remove(id)?;
-        self.queries.remove(&handle.inner.sql);
-        Some(handle)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum MatcherState {
     Created,
@@ -255,294 +85,8 @@ impl MatcherState {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct MatcherHandle {
-    inner: Arc<InnerMatcherHandle>,
-    state: StateLock,
-}
-
-#[derive(Debug)]
-struct InnerMatcherHandle {
-    id: Uuid,
-    sql: String,
-    hash: String,
-    pool: sqlite_pool::RusqlitePool,
-    parsed: ParsedSelect,
-    col_names: Vec<ColumnName>,
-    cancel: CancellationToken,
-    changes_tx: mpsc::Sender<MatchCandidates>,
-    last_change_rx: watch::Receiver<ChangeId>,
-    purge_tx: mpsc::Sender<oneshot::Sender<rusqlite::Result<usize>>>,
-    // some state from the matcher so we can take a look later
-    subs_path: String,
-    cached_statements: HashMap<String, MatcherStmt>,
-    metrics: HashMap<String, HandleMetrics>,
-}
-
-pub type MatchCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
-
-#[async_trait]
-impl Handle for MatcherHandle {
-    fn id(&self) -> Uuid {
-        self.inner.id
-    }
-
-    fn cancelled(&self) -> WaitForCancellationFuture<'_> {
-        self.inner.cancel.cancelled()
-    }
-
-    fn changes_tx(&self) -> mpsc::Sender<MatchCandidates> {
-        self.inner.changes_tx.clone()
-    }
-
-    async fn cleanup(&self) {
-        self.inner.cancel.cancel();
-        info!(sub_id = %self.inner.id, "Canceled subscription");
-    }
-
-    fn filter_matchable_change(
-        &self,
-        candidates: &mut MatchCandidates,
-        change: MatchableChange,
-    ) -> bool {
-        trace!("filtering change {change:?}");
-        // don't double process the same pk
-        if candidates
-            .get(change.table)
-            .map(|pks| pks.contains_key(change.pk))
-            .unwrap_or_default()
-        {
-            trace!("already contained key");
-            return false;
-        }
-
-        // don't consider changes that don't have both the table + col in the matcher query
-        if !self
-            .inner
-            .parsed
-            .table_columns
-            .get(change.table.as_str())
-            .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
-            .unwrap_or_default()
-        {
-            trace!("could not match against parsed query table and columns");
-            return false;
-        }
-
-        if let Some(v) = candidates.get_mut(change.table) {
-            v.insert(change.pk.to_vec(), change.cl).is_none()
-        } else {
-            candidates.insert(
-                change.table.clone(),
-                [(change.pk.to_vec(), change.cl)].into(),
-            );
-            true
-        }
-    }
-
-    fn get_counter(&self, table: &str) -> &HandleMetrics {
-        self.inner.metrics.get(table).unwrap_or_else(|| {
-            panic!(
-                "metrics counter for table '{}' missing. subs hash {}!",
-                self.inner.hash, table
-            )
-        })
-    }
-}
-
-impl MatcherHandle {
-    pub fn sql(&self) -> &String {
-        &self.inner.sql
-    }
-
-    pub fn hash(&self) -> &str {
-        &self.inner.hash
-    }
-
-    pub fn parsed_columns(&self) -> &[ResultColumn] {
-        &self.inner.parsed.columns
-    }
-
-    pub fn col_names(&self) -> &[ColumnName] {
-        &self.inner.col_names
-    }
-
-    pub fn subs_path(&self) -> &String {
-        &self.inner.subs_path
-    }
-
-    pub fn cached_stmts(&self) -> &HashMap<String, MatcherStmt> {
-        &self.inner.cached_statements
-    }
-
-    pub fn pool(&self) -> &RusqlitePool {
-        &self.inner.pool
-    }
-
-    fn wait_for_running_state(&self) {
-        let (lock, cvar) = &*self.state;
-        let mut state = lock.lock();
-        while !state.is_running() {
-            cvar.wait(&mut state);
-        }
-    }
-
-    pub fn max_change_id(&self, conn: &Connection) -> rusqlite::Result<ChangeId> {
-        self.wait_for_running_state();
-        let mut prepped = conn.prepare_cached("SELECT COALESCE(MAX(id), 0) FROM changes")?;
-        prepped.query_row([], |row| row.get(0))
-    }
-
-    pub fn last_change_id_sent(&self) -> ChangeId {
-        *self.inner.last_change_rx.borrow()
-    }
-
-    pub fn max_row_id(&self, conn: &Connection) -> rusqlite::Result<RowId> {
-        self.wait_for_running_state();
-        let mut prepped =
-            conn.prepare_cached("SELECT COALESCE(MAX(__corro_rowid), 0) FROM query")?;
-        prepped.query_row([], |row| row.get(0))
-    }
-
-    /// Purges old changes from the subscription's changes table, keeping only the most recent 500.
-    /// Returns the number of rows deleted.
-    ///
-    /// This method sends a request to the Matcher task to perform the purge.
-    pub async fn purge_old_changes(&self) -> rusqlite::Result<usize> {
-        self.wait_for_running_state();
-
-        let (tx, rx) = oneshot::channel();
-
-        // Send purge request to the Matcher task
-        self.inner
-            .purge_tx
-            .send(tx)
-            .await
-            .map_err(|_| rusqlite::Error::InvalidQuery)?;
-
-        // Wait for the result
-        rx.await.map_err(|_| rusqlite::Error::InvalidQuery)?
-    }
-
-    pub fn changes_since(
-        &self,
-        since: ChangeId,
-        conn: &Connection,
-        tx: mpsc::Sender<QueryEvent>,
-    ) -> rusqlite::Result<ChangeId> {
-        self.wait_for_running_state();
-
-        let mut prepped = conn.prepare_cached("SELECT COALESCE(MIN(id), 0) FROM changes")?;
-        let min_change_id: u64 = prepped.query_row([], |row| row.get(0))?;
-
-        // return error if we've cleared changes after the received change id
-        if since.0 + 1 < min_change_id {
-            return Err(rusqlite::Error::ModuleError(format!(
-                "subscription already deleted older changes, min change id: {min_change_id}",
-            )));
-        }
-
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed_columns().len()) {
-            query_cols.push(format!("col_{i}"));
-        }
-        let mut prepped = conn.prepare_cached(&format!(
-            "SELECT id, type, __corro_rowid, {} FROM changes WHERE id > ? ORDER BY id ASC",
-            query_cols.join(",")
-        ))?;
-
-        let col_count = prepped.column_count();
-
-        let mut max_change_id = since;
-
-        let mut rows = prepped.query([since])?;
-
-        loop {
-            let row = match rows.next()? {
-                Some(row) => row,
-                None => break,
-            };
-
-            let change_id: ChangeId = row.get(0)?;
-            if change_id.0 > max_change_id.0 {
-                max_change_id = change_id;
-            }
-
-            if let Err(e) = tx.blocking_send(QueryEvent::Change(
-                row.get(1)?,
-                row.get(2)?,
-                (3..col_count)
-                    .map(|i| row.get::<_, SqliteValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-                change_id,
-            )) {
-                error!("could not send change to channel: {e}");
-                break;
-            }
-        }
-
-        Ok(max_change_id)
-    }
-
-    pub fn all_rows(
-        &self,
-        conn: &Connection,
-        tx: mpsc::Sender<QueryEvent>,
-    ) -> Result<ChangeId, MatcherError> {
-        self.wait_for_running_state();
-        let mut query_cols = vec![];
-        for i in 0..(self.parsed_columns().len()) {
-            query_cols.push(format!("col_{i}"));
-        }
-        let mut prepped = conn.prepare_cached(&format!(
-            "SELECT __corro_rowid, {} FROM query",
-            query_cols.join(",")
-        ))?;
-
-        let col_count = prepped.column_count();
-
-        tx.blocking_send(QueryEvent::Columns(self.col_names().to_vec()))
-            .map_err(|_| MatcherError::EventReceiverClosed)?;
-
-        let start = Instant::now();
-        let mut rows = prepped.query([])?;
-        let elapsed = start.elapsed();
-
-        let mut count = 0;
-
-        loop {
-            let row = match rows.next()? {
-                Some(row) => row,
-                None => break,
-            };
-
-            tx.blocking_send(QueryEvent::Row(
-                row.get(0)?,
-                (1..col_count)
-                    .map(|i| row.get::<_, SqliteValue>(i))
-                    .collect::<rusqlite::Result<Vec<_>>>()?,
-            ))
-            .map_err(|_| MatcherError::EventReceiverClosed)?;
-            count += 1;
-        }
-
-        trace!("sent {count} rows");
-
-        let max_change_id = conn
-            .prepare("SELECT COALESCE(MAX(id),0) FROM changes")?
-            .query_row([], |row| row.get(0))?;
-
-        tx.blocking_send(QueryEvent::EndOfQuery {
-            time: elapsed.as_secs_f64(),
-            change_id: Some(max_change_id),
-        })
-        .map_err(|_| MatcherError::EventReceiverClosed)?;
-
-        Ok(max_change_id)
-    }
-}
-
 type StateLock = Arc<(Mutex<MatcherState>, Condvar)>;
+pub type MatchCandidates = IndexMap<TableName, IndexMap<Vec<u8>, i64>>;
 
 pub struct Matcher {
     pub id: Uuid,
@@ -550,7 +94,7 @@ pub struct Matcher {
     pub query: Stmt,
     pub cached_statements: HashMap<String, MatcherStmt>,
     pub pks: IndexMap<String, Vec<String>>,
-    pub parsed: ParsedSelect,
+    pub parsed: db::ParsedSelect,
     pub evt_tx: mpsc::Sender<QueryEvent>,
     pub col_names: Vec<ColumnName>,
     pub last_rowid: u64,
@@ -561,6 +105,7 @@ pub struct Matcher {
     last_change_tx: watch::Sender<ChangeId>,
     changes_rx: mpsc::Receiver<MatchCandidates>,
     purge_rx: mpsc::Receiver<oneshot::Sender<rusqlite::Result<usize>>>,
+    loop_cfg: MatcherLoopConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -590,6 +135,7 @@ impl Matcher {
         state_conn: &Connection,
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<(Matcher, MatcherHandle), MatcherError> {
         let sub_path = Self::sub_path(subs_path.as_path(), id);
         let sql_hash = hex::encode(seahash::hash(sql.as_bytes()).to_be_bytes());
@@ -625,7 +171,9 @@ impl Matcher {
         let (mut stmt, parsed) = match parser.next()?.ok_or(MatcherError::StatementRequired)? {
             Cmd::Stmt(stmt) => {
                 let parsed = match stmt {
-                    Stmt::Select(ref select) => extract_select_columns(select, schema)?,
+                    Stmt::Select(ref select) => {
+                        db::ParsedSelect::extract_select_columns(select, schema)?
+                    }
                     _ => return Err(MatcherError::UnsupportedStatement),
                 };
 
@@ -800,7 +348,7 @@ impl Matcher {
         }
 
         let handle = MatcherHandle {
-            inner: Arc::new(InnerMatcherHandle {
+            inner: Arc::new(handle::InnerMatcherHandle {
                 id,
                 sql: sql.to_owned(),
                 hash: sql_hash.clone(),
@@ -839,17 +387,18 @@ impl Matcher {
             last_change_tx,
             changes_rx,
             purge_rx,
+            loop_cfg,
         };
 
         Ok((matcher, handle))
     }
 
-    pub fn cleanup(id: Uuid, sub_path: Utf8PathBuf) -> rusqlite::Result<()> {
-        info!(sub_id = %id, "Attempting to cleanup... {}", sub_path);
+    pub fn cleanup(id: Uuid, sub_path: &Utf8PathBuf) -> rusqlite::Result<()> {
+        info!(sub_id = %id, %sub_path, "Attempting to cleanup...");
 
         block_in_place(|| {
-            if let Err(e) = std::fs::remove_dir_all(&sub_path) {
-                error!(sub_id = %id, "could not delete subscription base path {} due to: {e}", sub_path);
+            if let Err(error) = std::fs::remove_dir_all(&sub_path) {
+                error!(sub_id = %id, %sub_path, %error, "could not delete subscription base path");
             }
 
             Ok(())
@@ -885,6 +434,7 @@ impl Matcher {
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
         let sql: String = block_in_place(|| {
             let conn = Connection::open(Matcher::sub_db_path(&subs_path, id))?;
@@ -909,7 +459,8 @@ impl Matcher {
             }
         })?;
 
-        let (matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, &sql)?;
+        let (matcher, handle) =
+            Self::new(id, subs_path, schema, &state_conn, evt_tx, &sql, loop_cfg)?;
 
         spawn_counted(matcher.run_restore(state_conn, tripwire));
 
@@ -925,8 +476,10 @@ impl Matcher {
         evt_tx: mpsc::Sender<QueryEvent>,
         sql: &str,
         tripwire: Tripwire,
+        loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
-        let (mut matcher, handle) = Self::new(id, subs_path, schema, &state_conn, evt_tx, sql)?;
+        let (mut matcher, handle) =
+            Self::new(id, subs_path, schema, &state_conn, evt_tx, sql, loop_cfg)?;
 
         let pk_cols = matcher
             .pks
@@ -1115,10 +668,6 @@ impl Matcher {
     }
 
     async fn cmd_loop(mut self, mut state_conn: CrConn, mut tripwire: Tripwire) {
-        const PROCESS_CHANGES_THRESHOLD: usize = 1000;
-        const PROCESSING_WARN_THRESHOLD: Duration = Duration::from_secs(5);
-        const PROCESS_BUFFER_DEADLINE: Duration = Duration::from_millis(600);
-
         info!(sub_id = %self.id, "Starting loop to run the subscription");
         {
             let (lock, cvar) = &*self.state;
@@ -1132,10 +681,12 @@ impl Matcher {
         let mut buf = MatchCandidates::new();
         let mut buf_count = 0;
 
-        let mut purge_changes_interval = tokio::time::interval(Duration::from_secs(300));
+        let loop_cfg = self.loop_cfg.clone();
+
+        let mut purge_changes_interval = tokio::time::interval(loop_cfg.purge_changes_interval);
 
         // max duration of aggregating candidates
-        let process_changes_deadline = tokio::time::sleep(PROCESS_BUFFER_DEADLINE);
+        let process_changes_deadline = tokio::time::sleep(loop_cfg.process_buffer_interval);
         tokio::pin!(process_changes_deadline);
 
         loop {
@@ -1154,7 +705,7 @@ impl Matcher {
                         error!(sub_id = %self.id, "could not set status during cancellation: {e}");
                     }
                     info!(sub_id = %self.id, "attempting to cleanup");
-                    if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                    if let Err(e) = Self::cleanup(self.id, &self.base_path) {
                         error!("could not handle cleanup: {e}");
                     }
                     return;
@@ -1169,7 +720,7 @@ impl Matcher {
                         }
                     }
 
-                    if buf_count >= PROCESS_CHANGES_THRESHOLD {
+                    if buf_count >= loop_cfg.changes_threshold {
                         buf_count = 0;
                         Branch::NewCandidates(std::mem::take(&mut buf))
                     } else {
@@ -1179,7 +730,7 @@ impl Matcher {
                 _ = process_changes_deadline.as_mut() => {
                     process_changes_deadline
                         .as_mut()
-                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
+                        .reset((Instant::now() + loop_cfg.process_buffer_interval).into());
                     if buf_count == 0 {
                         continue;
                     }
@@ -1207,7 +758,7 @@ impl Matcher {
                             error!(sub_id = %self.id, "could not handle change: {e}");
                         }
                         info!(sub_id = %self.id, "attempting to cleanup");
-                        if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                        if let Err(e) = Self::cleanup(self.id, &self.base_path) {
                             error!("could not handle cleanup: {e}");
                         }
                         return;
@@ -1216,7 +767,7 @@ impl Matcher {
 
                     histogram!("corro.subs.changes.processing.duration.seconds", "sql_hash" => self.hash.clone()).record(elapsed);
 
-                    if elapsed >= PROCESSING_WARN_THRESHOLD {
+                    if elapsed >= loop_cfg.processing_warn_threshold {
                         warn!(sub_id = %self.id, "processed {buf_count} changes (very slowly) for subscription in {elapsed:?}");
                     } else {
                         debug!(sub_id = %self.id, "processed {buf_count} changes for subscription in {elapsed:?}");
@@ -1226,7 +777,7 @@ impl Matcher {
                     // reset the deadline
                     process_changes_deadline
                         .as_mut()
-                        .reset((Instant::now() + PROCESS_BUFFER_DEADLINE).into());
+                        .reset((Instant::now() + loop_cfg.process_buffer_interval).into());
                 }
                 Branch::PurgeOldChanges(maybe_response_tx) => {
                     let start = Instant::now();
@@ -1264,7 +815,7 @@ impl Matcher {
             let start = Instant::now();
             if let Err(e) = block_in_place(|| self.handle_candidates(&mut state_conn, buf, true)) {
                 error!(sub_id = %self.id, "could not handle final buffered candidates: {e}");
-                if let Err(e) = Self::cleanup(self.id, self.base_path.clone()) {
+                if let Err(e) = Self::cleanup(self.id, &self.base_path) {
                     error!(sub_id = %self.id, "could not handle cleanup: {e}");
                 }
                 return;
@@ -1779,375 +1330,6 @@ fn interrupt_deadline_guard(conn: &Connection, dur: Duration) -> DropGuard {
     cancel.drop_guard()
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ParsedSelect {
-    table_columns: IndexMap<String, HashSet<String>>,
-    aliases: HashMap<String, String>,
-    pub columns: Vec<ResultColumn>,
-    children: Vec<ParsedSelect>,
-}
-
-fn extract_select_columns(select: &Select, schema: &Schema) -> Result<ParsedSelect, MatcherError> {
-    let mut parsed = ParsedSelect::default();
-
-    if let OneSelect::Select {
-        ref from,
-        ref columns,
-        ref where_clause,
-        ..
-    } = select.body.select
-    {
-        let from_table = match from {
-            Some(from) => {
-                let from_table = match &from.select {
-                    Some(table) => match table.as_ref() {
-                        SelectTable::Table(name, alias, _) => {
-                            if schema.tables.contains_key(name.name.0.as_str()) {
-                                if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                }
-                                parsed.table_columns.entry(name.name.0.clone()).or_default();
-                                Some(&name.name)
-                            } else {
-                                return Err(MatcherError::TableNotFound(name.name.0.clone()));
-                            }
-                        }
-                        // TODO: add support for:
-                        // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
-                        // Select(Select, Option<As>),
-                        // Sub(FromClause, Option<As>),
-                        t => {
-                            warn!("ignoring {t:?}");
-                            None
-                        }
-                    },
-                    _ => {
-                        // according to the sqlite3-parser docs, this can't really happen
-                        // ignore!
-                        unreachable!()
-                    }
-                };
-                if let Some(ref joins) = from.joins {
-                    for join in joins.iter() {
-                        // let mut tbl_name = None;
-                        let tbl_name = match &join.table {
-                            SelectTable::Table(name, alias, _) => {
-                                if let Some(As::As(alias) | As::Elided(alias)) = alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                } else if let Some(ref alias) = name.alias {
-                                    parsed.aliases.insert(alias.0.clone(), name.name.0.clone());
-                                }
-                                parsed.table_columns.entry(name.name.0.clone()).or_default();
-                                &name.name
-                            }
-                            // TODO: add support for:
-                            // TableCall(QualifiedName, Option<Vec<Expr>>, Option<As>),
-                            // Select(Select, Option<As>),
-                            // Sub(FromClause, Option<As>),
-                            t => {
-                                warn!("ignoring JOIN's non-SelectTable::Table:  {t:?}");
-                                continue;
-                            }
-                        };
-                        // ON or USING
-                        if let Some(constraint) = &join.constraint {
-                            match constraint {
-                                JoinConstraint::On(expr) => {
-                                    extract_expr_columns(expr, schema, &mut parsed)?;
-                                }
-                                JoinConstraint::Using(names) => {
-                                    let entry =
-                                        parsed.table_columns.entry(tbl_name.0.clone()).or_default();
-                                    for name in names.iter() {
-                                        insert_col(entry, schema, &tbl_name.0, &name.0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(expr) = where_clause {
-                    extract_expr_columns(expr, schema, &mut parsed)?;
-                }
-                from_table
-            }
-            _ => None,
-        };
-
-        extract_columns(columns.as_slice(), from_table, schema, &mut parsed)?;
-    }
-
-    Ok(parsed)
-}
-
-fn insert_col(set: &mut HashSet<String>, schema: &Schema, tbl_name: &str, name: &str) {
-    let table = schema.tables.get(tbl_name);
-    if let Some(generated) =
-        table.and_then(|tbl| tbl.columns.get(name).and_then(|col| col.generated.as_ref()))
-    {
-        // recursively check for generated columns
-        for name in generated.from.iter() {
-            insert_col(set, schema, tbl_name, name);
-        }
-    } else {
-        set.insert(name.to_owned());
-    }
-}
-
-fn extract_expr_columns(
-    expr: &Expr,
-    schema: &Schema,
-    parsed: &mut ParsedSelect,
-) -> Result<(), MatcherError> {
-    match expr {
-        // simplest case
-        Expr::Qualified(tblname, colname) => {
-            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
-            // println!("adding column: {resolved_name} => {colname:?}");
-            insert_col(
-                parsed
-                    .table_columns
-                    .entry(resolved_name.clone())
-                    .or_default(),
-                schema,
-                resolved_name,
-                &colname.0,
-            );
-        }
-        // simplest case but also mentioning the schema
-        Expr::DoublyQualified(schema_name, tblname, colname) if schema_name.0 == "main" => {
-            let resolved_name = parsed.aliases.get(&tblname.0).unwrap_or(&tblname.0);
-            // println!("adding column: {resolved_name} => {colname:?}");
-            insert_col(
-                parsed
-                    .table_columns
-                    .entry(resolved_name.clone())
-                    .or_default(),
-                schema,
-                resolved_name,
-                &colname.0,
-            );
-        }
-
-        Expr::Name(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
-
-            let mut found = None;
-            for tbl in parsed.table_columns.keys() {
-                if let Some(tbl) = schema.tables.get(tbl) {
-                    if tbl.columns.contains_key(&check_col_name) {
-                        if found.is_some() {
-                            return Err(MatcherError::QualificationRequired {
-                                col_name: check_col_name,
-                            });
-                        }
-                        found = Some(tbl.name.as_str());
-                    }
-                }
-            }
-
-            if let Some(found) = found {
-                insert_col(
-                    parsed.table_columns.entry(found.to_owned()).or_default(),
-                    schema,
-                    found,
-                    &check_col_name,
-                );
-            } else {
-                return Err(MatcherError::TableForColumnNotFound {
-                    col_name: check_col_name,
-                });
-            }
-        }
-
-        Expr::Id(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
-
-            let mut found = None;
-            for tbl in parsed.table_columns.keys() {
-                if let Some(tbl) = schema.tables.get(tbl) {
-                    if tbl.columns.contains_key(&check_col_name) {
-                        if found.is_some() {
-                            return Err(MatcherError::QualificationRequired {
-                                col_name: check_col_name,
-                            });
-                        }
-                        found = Some(tbl.name.as_str());
-                    }
-                }
-            }
-
-            if let Some(found) = found {
-                insert_col(
-                    parsed.table_columns.entry(found.to_owned()).or_default(),
-                    schema,
-                    found,
-                    &colname.0,
-                );
-            } else {
-                if colname.0.starts_with('"') {
-                    return Ok(());
-                }
-                return Err(MatcherError::TableForColumnNotFound {
-                    col_name: colname.0.clone(),
-                });
-            }
-        }
-
-        Expr::Between { lhs, .. } => extract_expr_columns(lhs, schema, parsed)?,
-        Expr::Binary(lhs, _, rhs) => {
-            extract_expr_columns(lhs, schema, parsed)?;
-            extract_expr_columns(rhs, schema, parsed)?;
-        }
-        Expr::Case {
-            base,
-            when_then_pairs,
-            else_expr,
-        } => {
-            if let Some(expr) = base {
-                extract_expr_columns(expr, schema, parsed)?;
-            }
-            for (when_expr, _then_expr) in when_then_pairs.iter() {
-                // NOTE: should we also parse the then expr?
-                extract_expr_columns(when_expr, schema, parsed)?;
-            }
-            if let Some(expr) = else_expr {
-                extract_expr_columns(expr, schema, parsed)?;
-            }
-        }
-        Expr::Cast { expr, .. } => extract_expr_columns(expr, schema, parsed)?,
-        Expr::Collate(expr, _) => extract_expr_columns(expr, schema, parsed)?,
-        Expr::Exists(select) => {
-            parsed
-                .children
-                .push(extract_select_columns(select, schema)?);
-        }
-        Expr::FunctionCall { args, .. } => {
-            if let Some(args) = args {
-                for expr in args.iter() {
-                    extract_expr_columns(expr, schema, parsed)?;
-                }
-            }
-        }
-        Expr::InList { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, parsed)?;
-            if let Some(rhs) = rhs {
-                for expr in rhs.iter() {
-                    extract_expr_columns(expr, schema, parsed)?;
-                }
-            }
-        }
-        Expr::InSelect { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, parsed)?;
-            parsed.children.push(extract_select_columns(rhs, schema)?);
-        }
-        expr @ Expr::InTable { .. } => {
-            return Err(MatcherError::UnsupportedExpr { expr: expr.clone() });
-        }
-        Expr::IsNull(expr) => {
-            extract_expr_columns(expr, schema, parsed)?;
-        }
-        Expr::Like { lhs, rhs, .. } => {
-            extract_expr_columns(lhs, schema, parsed)?;
-            extract_expr_columns(rhs, schema, parsed)?;
-        }
-
-        Expr::NotNull(expr) => {
-            extract_expr_columns(expr, schema, parsed)?;
-        }
-        Expr::Parenthesized(parens) => {
-            for expr in parens.iter() {
-                extract_expr_columns(expr, schema, parsed)?;
-            }
-        }
-        Expr::Subquery(select) => {
-            parsed
-                .children
-                .push(extract_select_columns(select, schema)?);
-        }
-        Expr::Unary(_, expr) => {
-            extract_expr_columns(expr, schema, parsed)?;
-        }
-
-        // no column names in there...
-        // Expr::FunctionCallStar { name, filter_over } => todo!(),
-        // Expr::Id(_) => todo!(),
-        // Expr::Literal(_) => todo!(),
-        // Expr::Raise(_, _) => todo!(),
-        // Expr::Variable(_) => todo!(),
-        _ => {}
-    }
-
-    Ok(())
-}
-
-fn extract_columns(
-    columns: &[ResultColumn],
-    from: Option<&Name>,
-    schema: &Schema,
-    parsed: &mut ParsedSelect,
-) -> Result<(), MatcherError> {
-    let mut i = 0;
-    for col in columns.iter() {
-        match col {
-            ResultColumn::Expr(expr, _) => {
-                // println!("extracting col: {expr:?} (as: {maybe_as:?})");
-                extract_expr_columns(expr, schema, parsed)?;
-                parsed.columns.push(ResultColumn::Expr(
-                    expr.clone(),
-                    Some(As::As(Name(format!("col_{i}")))),
-                ));
-                i += 1;
-            }
-            ResultColumn::Star => {
-                if let Some(tbl_name) = from {
-                    if let Some(table) = schema.tables.get(&tbl_name.0) {
-                        let entry = parsed.table_columns.entry(table.name.clone()).or_default();
-                        for col in table.columns.keys() {
-                            entry.insert(col.clone());
-                            parsed.columns.push(ResultColumn::Expr(
-                                Expr::Name(Name(col.clone())),
-                                Some(As::As(Name(format!("col_{i}")))),
-                            ));
-                            i += 1;
-                        }
-                    } else {
-                        return Err(MatcherError::TableStarNotFound {
-                            tbl_name: tbl_name.0.clone(),
-                        });
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
-            ResultColumn::TableStar(tbl_name) => {
-                let name = parsed
-                    .aliases
-                    .get(tbl_name.0.as_str())
-                    .unwrap_or(&tbl_name.0);
-                if let Some(table) = schema.tables.get(name) {
-                    let entry = parsed.table_columns.entry(table.name.clone()).or_default();
-                    for col in table.columns.keys() {
-                        entry.insert(col.clone());
-                        parsed.columns.push(ResultColumn::Expr(
-                            Expr::Qualified(tbl_name.clone(), Name(col.clone())),
-                            Some(As::As(Name(format!("col_{i}")))),
-                        ));
-                        i += 1;
-                    }
-                } else {
-                    return Err(MatcherError::TableStarNotFound {
-                        tbl_name: name.clone(),
-                    });
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 fn table_to_expr(
     aliases: &HashMap<String, String>,
     tbl: &Table,
@@ -2172,70 +1354,6 @@ fn table_to_expr(
     );
 
     Ok(expr)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum MatcherError {
-    #[error(transparent)]
-    Lexer(#[from] sqlite3_parser::lexer::sql::Error),
-    #[error("one statement is required for matching")]
-    StatementRequired,
-    #[error("unsupported statement")]
-    UnsupportedStatement,
-    #[error("at least 1 table is required in FROM / JOIN clause")]
-    TableRequired,
-    #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
-    #[error("table not found in schema: {0}")]
-    TableNotFound(String),
-    #[error("no primary key for table: {0}")]
-    NoPrimaryKey(String),
-    #[error("aggregate missing primary key {0}.{1}")]
-    AggPrimaryKeyMissing(String, String),
-    #[error("JOIN .. ON expression is not supported for join on table '{table}': {expr:?}")]
-    JoinOnExprUnsupported { table: String, expr: Box<Expr> },
-    #[error("expression is not supported: {expr:?}")]
-    UnsupportedExpr { expr: Expr },
-    #[error("could not find table for {tbl_name}.* in corrosion's schema")]
-    TableStarNotFound { tbl_name: String },
-    #[error("<tbl>.{col_name} qualification required for ambiguous column name")]
-    QualificationRequired { col_name: String },
-    #[error("could not find table for column {col_name}")]
-    TableForColumnNotFound { col_name: String },
-    #[error("missing primary keys, this shouldn't happen")]
-    MissingPrimaryKeys,
-    #[error("change queue has been closed or is full")]
-    ChangeQueueClosedOrFull,
-    #[error("no change was inserted, this is not supposed to happen")]
-    NoChangeInserted,
-    #[error("change receiver is closed")]
-    EventReceiverClosed,
-    #[error(transparent)]
-    Unpack(#[from] UnpackError),
-    #[error("did not insert subscription")]
-    InsertSub,
-    #[error(transparent)]
-    FromSql(#[from] FromSqlError),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error("could not encode changeset for queue: {0}")]
-    ChangesetEncode(#[from] speedy::Error),
-    #[error("queue is full")]
-    QueueFull,
-    #[error("cannot restore existing subscription")]
-    CannotRestoreExisting,
-    #[error("could not acquire write permit")]
-    WritePermitAcquire(#[from] AcquireError),
-    #[error("subscription is not running")]
-    NotRunning,
-    #[error("subscription restore is missing SQL query")]
-    MissingSql,
-}
-
-impl MatcherError {
-    pub fn is_event_recv_closed(&self) -> bool {
-        matches!(self, MatcherError::EventReceiverClosed)
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2360,14 +1478,6 @@ fn num_bytes_needed_i32(val: i32) -> u8 {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum UnpackError {
-    #[error("abort")]
-    Abort,
-    #[error("misuse")]
-    Misuse,
-}
-
 pub fn unpack_columns(mut buf: &[u8]) -> Result<Vec<SqliteValueRef<'_>>, UnpackError> {
     let mut ret = vec![];
     let num_columns = buf.get_u8();
@@ -2437,13 +1547,18 @@ mod tests {
 
     use crate::{
         actor::ActorId,
-        agent::migrate,
+        agent::{SplitPool, migrate},
         base::CrsqlDbVersion,
         change::row_to_change,
         schema::{apply_schema, parse_sql},
         sqlite::{CrConn, rusqlite_to_crsqlite, setup_conn},
+        updates::Handle,
     };
     use corro_tests::tempdir::TempDir;
+
+    fn loop_cfg() -> MatcherLoopConfig {
+        MatcherLoopConfig::testing()
+    }
 
     use super::*;
 
@@ -2542,6 +1657,7 @@ mod tests {
                 &schema,
                 &pool,
                 tripwire.clone(),
+                Default::default(),
             )?;
 
             assert!(maybe_created.is_some());
@@ -2753,6 +1869,7 @@ mod tests {
                     &schema,
                     &pool,
                     tripwire.clone(),
+                    loop_cfg(),
                 )
                 .unwrap();
 
@@ -2951,7 +2068,14 @@ mod tests {
         // restore subscription
         let matcher_id = {
             let (matcher, created) = subs
-                .restore(id, &subscriptions_path, &schema, &pool, tripwire.clone())
+                .restore(
+                    id,
+                    &subscriptions_path,
+                    &schema,
+                    &pool,
+                    tripwire.clone(),
+                    loop_cfg(),
+                )
                 .unwrap();
             let mut rx = created.evt_rx;
 
@@ -3094,7 +2218,14 @@ mod tests {
 
         // a restore should start ok if we shutdown properly
         {
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                &subscriptions_path,
+                &schema,
+                &pool,
+                tripwire.clone(),
+                loop_cfg(),
+            );
             assert!(res.is_ok());
         }
 
@@ -3109,7 +2240,14 @@ mod tests {
             )
             .unwrap();
 
-            let res = subs.restore(id, &subscriptions_path, &schema, &pool, tripwire.clone());
+            let res = subs.restore(
+                id,
+                &subscriptions_path,
+                &schema,
+                &pool,
+                tripwire.clone(),
+                loop_cfg(),
+            );
             assert!(res.is_err());
         }
     }

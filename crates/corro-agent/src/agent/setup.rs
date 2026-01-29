@@ -312,6 +312,7 @@ async fn setup_spawn_subscriptions(
                         schema,
                         pool,
                         tripwire.clone(),
+                        Default::default(),
                     ) {
                         Ok(res) => res,
                         Err(e) => {
@@ -340,7 +341,7 @@ async fn setup_spawn_subscriptions(
 
     for id in to_cleanup {
         info!(sub_id = %id, "Cleaning up unclean subscription");
-        Matcher::cleanup(id, Matcher::sub_path(subs_path.as_path(), id))?;
+        Matcher::cleanup(id, &Matcher::sub_path(subs_path.as_path(), id))?;
     }
 
     Ok(Arc::new(TokioRwLock::new(subs_bcast_cache)))
