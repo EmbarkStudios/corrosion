@@ -35,6 +35,12 @@ pub struct SubParams {
     skip_rows: bool,
 }
 
+#[derive(Clone)]
+pub struct SubscriptionEvent {
+    pub buff: Bytes,
+    pub meta: QueryEventMeta,
+}
+
 pub async fn api_v1_sub_by_id(
     Extension(agent): Extension<Agent>,
     Extension(bcast_cache): Extension<SharedMatcherBroadcastCache>,
@@ -121,21 +127,21 @@ async fn sub_by_id(
         .expect("could not build query response body")
 }
 
+#[inline]
 fn make_query_event_bytes(
     buf: &mut BytesMut,
     query_evt: &QueryEvent,
-) -> serde_json::Result<(Bytes, QueryEventMeta)> {
+) -> serde_json::Result<SubscriptionEvent> {
     {
         let mut writer = buf.writer();
         serde_json::to_writer(&mut writer, query_evt)?;
-
-        // NOTE: I think that's infaillible...
-        writer
-            .write_all(b"\n")
-            .expect("could not write new line to BytesMut Writer");
     }
 
-    Ok((buf.split().freeze(), query_evt.meta()))
+    buf.put_u8(b'\n');
+    Ok(SubscriptionEvent {
+        buff: buf.split().freeze(),
+        meta: query_evt.meta(),
+    })
 }
 
 const MAX_UNSUB_TIME: Duration = Duration::from_secs(10 * 60);
@@ -145,7 +151,7 @@ const RECEIVERS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 pub async fn process_sub_channel(
     subs: SubsManager,
     id: Uuid,
-    tx: broadcast::Sender<(Bytes, QueryEventMeta)>,
+    tx: broadcast::Sender<SubscriptionEvent>,
     mut evt_rx: mpsc::Receiver<QueryEvent>,
 ) {
     let mut buf = BytesMut::new();
@@ -200,10 +206,10 @@ pub async fn process_sub_channel(
         let is_still_active = match make_query_event_bytes(&mut buf, &query_evt) {
             Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
-                _ = tx.send((
-                    error_to_query_event_bytes(&mut buf, e),
-                    QueryEventMeta::Error,
-                ));
+                _ = tx.send(SubscriptionEvent {
+                    buff: error_to_query_event_bytes(&mut buf, e),
+                    meta: QueryEventMeta::Error,
+                });
                 break;
             }
         };
@@ -324,7 +330,7 @@ impl From<MatcherUpsertError> for http::Response<axum::body::Body> {
             .expect("could not build error response")
     }
 }
-pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<(Bytes, QueryEventMeta)>>;
+pub type MatcherBroadcastCache = HashMap<Uuid, broadcast::Sender<SubscriptionEvent>>;
 pub type SharedMatcherBroadcastCache = Arc<TokioRwLock<MatcherBroadcastCache>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -334,7 +340,7 @@ pub enum CatchUpError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
-    Send(#[from] mpsc::error::SendError<(Bytes, QueryEventMeta)>),
+    Send(#[from] mpsc::error::SendError<SubscriptionEvent>),
     #[error(transparent)]
     SerdeJson(#[from] serde_json::Error),
     #[error(transparent)]
@@ -358,16 +364,20 @@ fn error_to_query_event_bytes<E: ToCompactString>(buf: &mut BytesMut, e: E) -> B
     buf.split().freeze()
 }
 
+#[inline]
 fn error_to_query_event_bytes_with_meta<E: ToCompactString>(
     buf: &mut BytesMut,
     e: E,
-) -> (Bytes, QueryEventMeta) {
-    (error_to_query_event_bytes(buf, e), QueryEventMeta::Error)
+) -> SubscriptionEvent {
+    SubscriptionEvent {
+        buff: error_to_query_event_bytes(buf, e),
+        meta: QueryEventMeta::Error,
+    }
 }
 
 async fn catch_up_sub_anew(
     matcher: &MatcherHandle,
-    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
+    evt_tx: &mpsc::Sender<SubscriptionEvent>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
@@ -400,7 +410,7 @@ async fn catch_up_sub_anew(
 async fn catch_up_sub_from(
     matcher: &MatcherHandle,
     from: ChangeId,
-    evt_tx: &mpsc::Sender<(Bytes, QueryEventMeta)>,
+    evt_tx: &mpsc::Sender<SubscriptionEvent>,
 ) -> Result<ChangeId, CatchUpError> {
     let (q_tx, mut q_rx) = mpsc::channel(10240);
 
@@ -430,8 +440,8 @@ async fn catch_up_sub_from(
 pub async fn catch_up_sub(
     matcher: MatcherHandle,
     params: SubParams,
-    mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    evt_tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    mut sub_rx: broadcast::Receiver<SubscriptionEvent>,
+    evt_tx: mpsc::Sender<SubscriptionEvent>,
 ) {
     debug!("catching up sub {} params: {:?}", matcher.id(), params);
 
@@ -448,7 +458,7 @@ pub async fn catch_up_sub(
         let cancel = cancel.clone();
         async move {
             loop {
-                let (buf, meta) = tokio::select! {
+                let eve = tokio::select! {
                     _ = cancel.cancelled() => {
                         break;
                     },
@@ -456,8 +466,8 @@ pub async fn catch_up_sub(
                     else => break
                 };
 
-                if let QueryEventMeta::Change(change_id) = meta {
-                    if let Err(_e) = queue_tx.try_send((buf, change_id)) {
+                if let QueryEventMeta::Change(change_id) = eve.meta {
+                    if let Err(_e) = queue_tx.try_send((eve.buff, change_id)) {
                         return Err(eyre::eyre!(
                             "catching up too slowly, gave up after buffering {MAX_EVENTS_BUFFER_SIZE} events"
                         ));
@@ -582,7 +592,10 @@ pub async fn catch_up_sub(
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
             if let Err(_e) = evt_tx
-                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .send(SubscriptionEvent {
+                    buff: event_buf,
+                    meta: QueryEventMeta::Change(change_id),
+                })
                 .await
             {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
@@ -601,7 +614,10 @@ pub async fn catch_up_sub(
         if change_id > last_change_id {
             info!(sub_id = %matcher.id(), "change was more recent, sending!");
             if let Err(_e) = evt_tx
-                .send((event_buf, QueryEventMeta::Change(change_id)))
+                .send(SubscriptionEvent {
+                    buff: event_buf,
+                    meta: QueryEventMeta::Change(change_id),
+                })
                 .await
             {
                 warn!(sub_id = %matcher.id(), "could not send buffered events to subscriber, receiver must be gone!");
@@ -637,7 +653,7 @@ pub async fn upsert_sub(
     subs: &SubsManager,
     bcast_write: &mut MatcherBroadcastCache,
     params: SubParams,
-    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    tx: mpsc::Sender<SubscriptionEvent>,
 ) -> Result<Uuid, MatcherUpsertError> {
     if let Some(created) = maybe_created {
         if params.from.is_some() {
@@ -703,6 +719,7 @@ pub async fn api_v1_subs(
         &agent.schema().read(),
         agent.pool(),
         tripwire.clone(),
+        Default::default(),
     );
 
     let (handle, maybe_created) = match upsert_res {
@@ -749,17 +766,17 @@ const MAX_EVENTS_BUFFER_SIZE: usize = 1024;
 
 async fn forward_sub_to_sender(
     handle: MatcherHandle,
-    mut sub_rx: broadcast::Receiver<(Bytes, QueryEventMeta)>,
-    tx: mpsc::Sender<(Bytes, QueryEventMeta)>,
+    mut sub_rx: broadcast::Receiver<SubscriptionEvent>,
+    tx: mpsc::Sender<SubscriptionEvent>,
     skip_rows: bool,
 ) {
     info!(sub_id = %handle.id(), "forwarding subscription events to a sender");
 
     loop {
-        let (event_buf, meta) = tokio::select! {
+        let eve = tokio::select! {
             res = sub_rx.recv() => {
                 match res {
-                    Ok((event_buf, meta)) => (event_buf, meta),
+                    Ok(eve) => eve,
                     Err(RecvError::Lagged(skipped)) => {
                         warn!(sub_id = %handle.id(), "subscription skipped {} events, aborting", skipped);
                         return;
@@ -778,13 +795,13 @@ async fn forward_sub_to_sender(
 
         if skip_rows
             && matches!(
-                meta,
+                eve.meta,
                 QueryEventMeta::Columns | QueryEventMeta::Row(_) | QueryEventMeta::EndOfQuery(_)
             )
         {
             continue;
         }
-        if let Err(e) = tx.send((event_buf, meta)).await {
+        if let Err(e) = tx.send(eve).await {
             warn!(sub_id = %handle.id(), "could not send subscription event to channel: {e}");
             return;
         }
@@ -794,12 +811,11 @@ async fn forward_sub_to_sender(
 async fn handle_sub_event(
     sub_id: Uuid,
     buf: &mut BytesMut,
-    event_buf: Bytes,
-    meta: QueryEventMeta,
+    event: SubscriptionEvent,
     tx: &mut BodySender,
     last_change_id: &mut ChangeId,
 ) -> Result<(), crate::api::utils::BodySendError> {
-    match meta {
+    match event.meta {
         QueryEventMeta::EndOfQuery(Some(change_id)) | QueryEventMeta::Change(change_id) => {
             if !last_change_id.is_zero() && change_id > *last_change_id + 1 {
                 warn!(%sub_id, "non-contiguous change id (> + 1) received: {change_id:?}, last seen: {last_change_id:?}");
@@ -814,7 +830,7 @@ async fn handle_sub_event(
             // do nothing
         }
     }
-    buf.extend_from_slice(&event_buf);
+    buf.extend_from_slice(&event.buff);
     let to_send = if buf.len() >= 64 * 1024 {
         buf.split().freeze()
     } else {
@@ -826,7 +842,7 @@ async fn handle_sub_event(
 
 async fn forward_bytes_to_body_sender(
     sub_id: Uuid,
-    mut rx: mpsc::Receiver<(Bytes, QueryEventMeta)>,
+    mut rx: mpsc::Receiver<SubscriptionEvent>,
     mut tx: BodySender,
     mut tripwire: Tripwire,
 ) {
@@ -842,8 +858,8 @@ async fn forward_bytes_to_body_sender(
             biased;
             res = rx.recv() => {
                 match res {
-                    Some((event_buf, meta)) => {
-                        if let Err(e) = handle_sub_event(sub_id, &mut buf, event_buf, meta, &mut tx, &mut last_change_id).await {
+                    Some(eve) => {
+                        if let Err(e) = handle_sub_event(sub_id, &mut buf, eve, &mut tx, &mut last_change_id).await {
                             warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
                             return;
                         }
@@ -872,16 +888,8 @@ async fn forward_bytes_to_body_sender(
         }
     }
 
-    while let Ok((event_buf, meta)) = rx.try_recv() {
-        if let Err(e) = handle_sub_event(
-            sub_id,
-            &mut buf,
-            event_buf,
-            meta,
-            &mut tx,
-            &mut last_change_id,
-        )
-        .await
+    while let Ok(eve) = rx.try_recv() {
+        if let Err(e) = handle_sub_event(sub_id, &mut buf, eve, &mut tx, &mut last_change_id).await
         {
             warn!(%sub_id, "could not forward subscription query event to receiver: {e}");
             return;
