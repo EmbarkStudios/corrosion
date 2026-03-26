@@ -111,15 +111,15 @@ fn handle_query_metrics(elapsed: Duration) {
         .increment(other_rw_queries_count);
 }
 
-fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent) {
+fn tracing_callback_ro(ev: rusqlite::trace::TraceEvent<'_>) {
     handle_sql_tracing_event(ev, true);
 }
 
-fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent) {
+fn tracing_callback_rw(ev: rusqlite::trace::TraceEvent<'_>) {
     handle_sql_tracing_event(ev, false);
 }
 
-fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent, readonly: bool) {
+fn handle_sql_tracing_event(ev: rusqlite::trace::TraceEvent<'_>, readonly: bool) {
     if let rusqlite::trace::TraceEvent::Profile(stmt_ref, duration) = ev {
         let dur = duration.as_nanos();
         let sql = stmt_ref.sql().to_string();
@@ -295,14 +295,14 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 pub trait Migration {
-    fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()>;
+    fn migrate(&self, tx: &Transaction<'_>) -> rusqlite::Result<()>;
 }
 
 impl<F> Migration for F
 where
-    F: Fn(&Transaction) -> rusqlite::Result<()>,
+    F: Fn(&Transaction<'_>) -> rusqlite::Result<()>,
 {
-    fn migrate(&self, tx: &Transaction) -> rusqlite::Result<()> {
+    fn migrate(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
         self(tx)
     }
 }
@@ -310,7 +310,7 @@ where
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 // Read migration version field from the SQLite db
-pub fn migration_version(tx: &Transaction) -> Option<usize> {
+pub fn migration_version(tx: &Transaction<'_>) -> Option<usize> {
     #[allow(deprecated)] // To keep compatibility with lower rusqlite versions
     tx.query_row(
         "SELECT value FROM __corro_state WHERE key = ?",
@@ -322,7 +322,7 @@ pub fn migration_version(tx: &Transaction) -> Option<usize> {
 }
 
 // Set user version field from the SQLite db
-pub fn set_migration_version(tx: &Transaction, v: usize) -> rusqlite::Result<usize> {
+pub fn set_migration_version(tx: &Transaction<'_>, v: usize) -> rusqlite::Result<usize> {
     tx.execute(
         "INSERT OR REPLACE INTO __corro_state VALUES (?, ?)",
         params![SCHEMA_VERSION_KEY, v],

@@ -285,7 +285,7 @@ pub enum ApplySchemaError {
 }
 
 pub fn apply_schema(
-    tx: &Transaction,
+    tx: &Transaction<'_>,
     schema: &Schema,
     new_schema: &mut Schema,
 ) -> Result<(), ApplySchemaError> {

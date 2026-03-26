@@ -58,7 +58,7 @@ pub async fn make_broadcastable_changes<F, T>(
     f: F,
 ) -> Result<(T, Option<CrsqlDbVersion>, Duration), ChangeError>
 where
-    F: FnOnce(&InterruptibleTransaction<Transaction>) -> Result<T, ChangeError>,
+    F: FnOnce(&InterruptibleTransaction<Transaction<'_>>) -> Result<T, ChangeError>,
 {
     trace!("getting conn...");
     let mut conn = agent.pool().write_priority().await?;
@@ -87,19 +87,20 @@ where
         let timeout = timeout.map(Duration::from_secs);
         let tx = InterruptibleTransaction::new(tx, timeout, "local_changes");
 
-        let _ = tx
-            .prepare_cached("SELECT crsql_set_ts(?)")
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?
-            .query_row([&ts], |row| row.get::<_, String>(0))
-            .map_err(|source| ChangeError::Rusqlite {
-                source,
-                actor_id: Some(actor_id),
-                version: None,
-            })?;
+        drop(
+            tx.prepare_cached("SELECT crsql_set_ts(?)")
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: None,
+                })?
+                .query_row([&ts], |row| row.get::<_, String>(0))
+                .map_err(|source| ChangeError::Rusqlite {
+                    source,
+                    actor_id: Some(actor_id),
+                    version: None,
+                })?,
+        );
 
         // Execute whatever might mutate state data
         let ret = f(&tx)?;
@@ -281,12 +282,12 @@ async fn build_query_rows_response(
         let conn = match pool.read().await {
             Ok(conn) => conn,
             Err(e) => {
-                _ = res_tx.send(Err((
+                drop(res_tx.send(Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     ExecResult::Error {
                         error: e.to_string(),
                     },
-                )));
+                ))));
                 return;
             }
         };
@@ -298,23 +299,23 @@ async fn build_query_rows_response(
         let mut prepped = match prepped_res {
             Ok(prepped) => prepped,
             Err(e) => {
-                _ = res_tx.send(Err((
+                drop(res_tx.send(Err((
                     StatusCode::BAD_REQUEST,
                     ExecResult::Error {
                         error: e.to_string(),
                     },
-                )));
+                ))));
                 return;
             }
         };
 
         if !prepped.readonly() {
-            _ = res_tx.send(Err((
+            drop(res_tx.send(Err((
                 StatusCode::BAD_REQUEST,
                 ExecResult::Error {
                     error: "statement is not readonly".into(),
                 },
-            )));
+            ))));
             return;
         }
 
@@ -391,12 +392,12 @@ async fn build_query_rows_response(
             let mut rows = match query {
                 Ok(rows) => rows,
                 Err(e) => {
-                    _ = res_tx.send(Err((
+                    drop(res_tx.send(Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         ExecResult::Error {
                             error: e.to_string(),
                         },
-                    )));
+                    ))));
                     return;
                 }
             };
@@ -434,7 +435,9 @@ async fn build_query_rows_response(
                                 rowid += 1;
                             }
                             Err(e) => {
-                                _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+                                drop(
+                                    data_tx.blocking_send(QueryEvent::Error(e.to_compact_string())),
+                                );
                                 return;
                             }
                         }
@@ -444,16 +447,16 @@ async fn build_query_rows_response(
                         break;
                     }
                     Err(e) => {
-                        _ = data_tx.blocking_send(QueryEvent::Error(e.to_compact_string()));
+                        drop(data_tx.blocking_send(QueryEvent::Error(e.to_compact_string())));
                         return;
                     }
                 }
             }
 
-            _ = data_tx.blocking_send(QueryEvent::EndOfQuery {
+            drop(data_tx.blocking_send(QueryEvent::EndOfQuery {
                 time: elapsed.as_secs_f64(),
                 change_id: None,
-            });
+            }));
         });
     });
 

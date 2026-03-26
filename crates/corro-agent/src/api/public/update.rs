@@ -131,7 +131,7 @@ pub async fn process_update_channel(
                     Err(e) => {
                         match make_query_event_bytes(&mut buf, &NotifyEvent::Error(e.to_compact_string())) {
                             Ok(b) => {
-                                let _ = tx.send(b);
+                                drop(tx.send(b));
                             }
                             Err(e) => {
                                 warn!(update_id = %id, "failed to send error in update channel: {e}");

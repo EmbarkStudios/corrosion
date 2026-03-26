@@ -52,7 +52,7 @@ impl Change {
     }
 }
 
-pub fn row_to_change(row: &Row) -> Result<Change, rusqlite::Error> {
+pub fn row_to_change(row: &Row<'_>) -> Result<Change, rusqlite::Error> {
     Ok(Change {
         table: row.get(0)?,
         pk: row.get(1)?,
@@ -126,11 +126,8 @@ where
         self.buffered_size = 0;
 
         loop {
-            trace!("chunking through the rows iterator");
             match self.iter.next() {
                 Some(Ok(change)) => {
-                    trace!("got change: {change:?}");
-
                     self.last_pushed_seq = change.seq;
 
                     let size = self.changes.insert(change);

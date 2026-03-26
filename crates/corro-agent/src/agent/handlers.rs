@@ -439,9 +439,9 @@ fn wal_checkpoint(conn: &rusqlite::Connection, timeout: u64) -> eyre::Result<()>
         histogram!("corro.db.wal.truncate.seconds").record(start.elapsed().as_secs_f64());
     }
 
-    _ = conn.pragma_update(None, "busy_timeout", orig);
+    drop(conn.pragma_update(None, "busy_timeout", orig));
 
-    Ok::<_, eyre::Report>(())
+    Ok(())
 }
 
 /// If the number of unused free pages is above the provided limit,

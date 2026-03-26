@@ -23,7 +23,7 @@ use tokio::{
     task::{block_in_place, JoinError},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use tripwire::Tripwire;
 use uuid::Uuid;
 
@@ -199,10 +199,10 @@ pub async fn process_sub_channel(
         let is_still_active = match make_query_event_bytes(&mut buf, &query_evt) {
             Ok(b) => tx.send(b).is_ok(),
             Err(e) => {
-                _ = tx.send(SubscriptionEvent {
+                drop(tx.send(SubscriptionEvent {
                     buff: error_to_query_event_bytes(&mut buf, e),
                     meta: QueryEventMeta::Error,
-                });
+                }));
                 break;
             }
         };
@@ -473,9 +473,11 @@ pub async fn catch_up_sub(
                     let conn = match matcher.pool().get().await {
                         Ok(conn) => conn,
                         Err(e) => {
-                            _ = evt_tx
-                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                .await;
+                            drop(
+                                evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await,
+                            );
                             return;
                         }
                     };
@@ -491,9 +493,11 @@ pub async fn catch_up_sub(
             Ok(change_id) => change_id,
             Err(e) => {
                 if !matches!(e, CatchUpError::Send(_)) {
-                    _ = evt_tx
-                        .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                        .await;
+                    drop(
+                        evt_tx
+                            .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                            .await,
+                    );
                 }
                 return;
             }
@@ -523,12 +527,14 @@ pub async fn catch_up_sub(
             }
             TryRecvError::Disconnected => {
                 // abnormal
-                _ = evt_tx
-                    .send(error_to_query_event_bytes_with_meta(
-                        &mut buf,
-                        "exceeded events buffer",
-                    ))
-                    .await;
+                drop(
+                    evt_tx
+                        .send(error_to_query_event_bytes_with_meta(
+                            &mut buf,
+                            "exceeded events buffer",
+                        ))
+                        .await,
+                );
                 return;
             }
         },
@@ -549,9 +555,11 @@ pub async fn catch_up_sub(
                     Ok(new_last_change_id) => last_change_id = new_last_change_id,
                     Err(e) => {
                         if !matches!(e, CatchUpError::Send(_)) {
-                            _ = evt_tx
-                                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                                .await;
+                            drop(
+                                evt_tx
+                                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                                    .await,
+                            );
                         }
                         return;
                     }
@@ -563,12 +571,14 @@ pub async fn catch_up_sub(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         if change_id >= min_change_id {
-            _ = evt_tx
-                .send(error_to_query_event_bytes_with_meta(
-                    &mut buf,
-                    "could not catch up to changes in 5 attempts",
-                ))
-                .await;
+            drop(
+                evt_tx
+                    .send(error_to_query_event_bytes_with_meta(
+                        &mut buf,
+                        "could not catch up to changes in 5 attempts",
+                    ))
+                    .await,
+            );
             return;
         }
     }
@@ -619,15 +629,19 @@ pub async fn catch_up_sub(
     let sub_rx = match queue_task.await {
         Ok(Ok(sub_rx)) => sub_rx,
         Ok(Err(e)) => {
-            _ = evt_tx
-                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                .await;
+            drop(
+                evt_tx
+                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                    .await,
+            );
             return;
         }
         Err(e) => {
-            _ = evt_tx
-                .send(error_to_query_event_bytes_with_meta(&mut buf, e))
-                .await;
+            drop(
+                evt_tx
+                    .send(error_to_query_event_bytes_with_meta(&mut buf, e))
+                    .await,
+            );
             return;
         }
     };

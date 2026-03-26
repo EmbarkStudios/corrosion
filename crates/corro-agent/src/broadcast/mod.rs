@@ -360,7 +360,7 @@ pub fn runtime_loop(
                     },
                     input = rx_foca.recv(), if !foca_done => match input {
                         Some(FocaInput::Data(data)) => {
-                            _ = foca.handle_data(&data, &mut runtime);
+                            drop(foca.handle_data(&data, &mut runtime));
                         },
                         None => {
                             foca_done = true

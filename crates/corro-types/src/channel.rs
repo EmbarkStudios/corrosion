@@ -34,7 +34,7 @@ impl<T> Clone for CorroSender<T> {
 }
 
 impl<T: Debug> Debug for CorroSender<T> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
@@ -46,7 +46,7 @@ pub struct CorroReceiver<T> {
 }
 
 impl<T: Debug> Debug for CorroReceiver<T> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }

@@ -748,19 +748,21 @@ pub async fn start(
                                         warn!("could not receive pg frontend message: {e}");
                                         // attempt to send this...
                                         if let Some(back_tx) = back_tx.upgrade() {
-                                            _ = back_tx.try_send(
-                                                (
-                                                    PgWireBackendMessage::ErrorResponse(
-                                                        ErrorInfo::new(
-                                                            "FATAL".to_owned(),
-                                                            "XX000".to_owned(),
-                                                            e.to_string(),
-                                                        )
+                                            drop(
+                                                back_tx.try_send(
+                                                    (
+                                                        PgWireBackendMessage::ErrorResponse(
+                                                            ErrorInfo::new(
+                                                                "FATAL".to_owned(),
+                                                                "XX000".to_owned(),
+                                                                e.to_string(),
+                                                            )
+                                                            .into(),
+                                                        ),
+                                                        true,
+                                                    )
                                                         .into(),
-                                                    ),
-                                                    true,
-                                                )
-                                                    .into(),
+                                                ),
                                             );
                                         }
                                         break;
@@ -819,8 +821,8 @@ pub async fn start(
                             debug!("Closing connection due to corrosion shutdown");
                             // Give 1s for graceful shutdown of the connection
                             timeout(Duration::from_millis(1000), async move {
-                                let _ = sink
-                                    .feed(PgWireBackendMessage::ErrorResponse(
+                                drop(
+                                    sink.feed(PgWireBackendMessage::ErrorResponse(
                                         ErrorInfo::new(
                                             "ERROR".to_owned(),
                                             sql_state::SqlState::ADMIN_SHUTDOWN.code().into(),
@@ -828,9 +830,10 @@ pub async fn start(
                                         )
                                         .into(),
                                     ))
-                                    .await;
-                                let _ = sink.flush().await;
-                                let _ = sink.close().await;
+                                    .await,
+                                );
+                                drop(sink.flush().await);
+                                drop(sink.close().await);
                             })
                             .await?;
                         } else {
@@ -842,7 +845,7 @@ pub async fn start(
                             // However, if this is not handled correctly we time out later.
                             //
                             // If we are shutting down when the client disconnects, we just exit. Don't need to timeout here
-                            let _ = sink.close().preemptible(&mut tripwire).await;
+                            drop(sink.close().preemptible(&mut tripwire).await);
                         }
                         Ok::<_, std::io::Error>(())
                     }
@@ -945,7 +948,7 @@ pub async fn start(
 
                         let mut prepared: HashMap<CompactString, Prepared> = HashMap::new();
 
-                        let mut portals: HashMap<CompactString, Portal> = HashMap::new();
+                        let mut portals: HashMap<CompactString, Portal<'_>> = HashMap::new();
 
                         let mut discard_until_sync = false;
 
@@ -2071,41 +2074,45 @@ pub async fn start(
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         error!("connection failed: {e}");
-                        _ = back_tx
-                            .send(
-                                (
-                                    PgWireBackendMessage::ErrorResponse(
-                                        ErrorInfo::new(
-                                            "FATAL".to_owned(),
-                                            "XX000".to_owned(),
-                                            e.to_string(),
-                                        )
+                        drop(
+                            back_tx
+                                .send(
+                                    (
+                                        PgWireBackendMessage::ErrorResponse(
+                                            ErrorInfo::new(
+                                                "FATAL".to_owned(),
+                                                "XX000".to_owned(),
+                                                e.to_string(),
+                                            )
+                                            .into(),
+                                        ),
+                                        true,
+                                    )
                                         .into(),
-                                    ),
-                                    true,
                                 )
-                                    .into(),
-                            )
-                            .await;
+                                .await,
+                        );
                     }
                     Err(e) => {
                         error!("spawn_blocking failed: {e}");
-                        _ = back_tx
-                            .send(
-                                (
-                                    PgWireBackendMessage::ErrorResponse(
-                                        ErrorInfo::new(
-                                            "FATAL".to_owned(),
-                                            "XX000".to_owned(),
-                                            e.to_string(),
-                                        )
+                        drop(
+                            back_tx
+                                .send(
+                                    (
+                                        PgWireBackendMessage::ErrorResponse(
+                                            ErrorInfo::new(
+                                                "FATAL".to_owned(),
+                                                "XX000".to_owned(),
+                                                e.to_string(),
+                                            )
+                                            .into(),
+                                        ),
+                                        true,
+                                    )
                                         .into(),
-                                    ),
-                                    true,
                                 )
-                                    .into(),
-                            )
-                            .await;
+                                .await,
+                        );
                     }
                 }
 
@@ -2570,10 +2577,11 @@ impl<'conn> Session<'conn> {
     fn set_ts(&self) -> Result<(), rusqlite::Error> {
         let ts = Timestamp::from(self.agent.clock().new_timestamp());
 
-        let _ = self
-            .conn
-            .prepare_cached("SELECT crsql_set_ts(?)")?
-            .query_row([&ts], |row| row.get::<_, String>(0))?;
+        drop(
+            self.conn
+                .prepare_cached("SELECT crsql_set_ts(?)")?
+                .query_row([&ts], |row| row.get::<_, String>(0))?,
+        );
 
         Ok(())
     }
@@ -2593,7 +2601,7 @@ impl<'conn> Drop for Session<'conn> {
 }
 
 fn send_ready(
-    session: &mut Session,
+    session: &mut Session<'_>,
     discard_until_sync: bool,
     back_tx: &Sender<BackendResponse>,
 ) -> Result<(), BoxError> {
@@ -3592,7 +3600,7 @@ impl<'a> FieldFormats<'a> {
 }
 
 fn field_types(
-    prepped: &Statement,
+    prepped: &Statement<'_>,
     parsed_cmd: &ParsedCmd,
     field_formats: FieldFormats<'_>,
 ) -> Result<Vec<FieldInfo>, UnsupportedSqliteToPostgresType> {

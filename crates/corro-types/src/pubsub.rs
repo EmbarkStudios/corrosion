@@ -70,8 +70,8 @@ pub struct MatcherCreated {
 const SUB_EVENT_CHANNEL_CAP: usize = 512;
 
 impl Manager<MatcherHandle> for SubsManager {
-    fn trait_type(&self) -> String {
-        "subs".to_string()
+    fn trait_type(&self) -> &'static str {
+        "subs"
     }
 
     fn get(&self, id: &Uuid) -> Option<MatcherHandle> {
@@ -310,16 +310,14 @@ impl Handle for MatcherHandle {
     fn filter_matchable_change(
         &self,
         candidates: &mut MatchCandidates,
-        change: MatchableChange,
+        change: &MatchableChange<'_>,
     ) -> bool {
-        trace!("filtering change {change:?}");
         // don't double process the same pk
         if candidates
             .get(change.table)
             .map(|pks| pks.contains_key(change.pk))
             .unwrap_or_default()
         {
-            trace!("already contained key");
             return false;
         }
 
@@ -332,7 +330,6 @@ impl Handle for MatcherHandle {
             .map(|cols| change.column.is_crsql_sentinel() || cols.contains(change.column.as_str()))
             .unwrap_or_default()
         {
-            trace!("could not match against parsed query table and columns");
             return false;
         }
 
@@ -454,6 +451,8 @@ impl MatcherHandle {
             " FROM changes WHERE id > ? ORDER BY id ASC",
         );
 
+        tracing::error!(query = prepped_query, "prepped");
+
         let mut prepped = conn.prepare_cached(&prepped_query)?;
 
         let col_count = prepped.column_count();
@@ -495,8 +494,12 @@ impl MatcherHandle {
         tx: mpsc::Sender<QueryEvent>,
     ) -> Result<ChangeId, MatcherError> {
         self.wait_for_running_state();
-        let mut prepped =
-            conn.prepare_cached(&self.make_query("SELECT __corro_rowid, ", " FROM query"))?;
+
+        let prepped = self.make_query("SELECT __corro_rowid, ", " FROM query");
+
+        tracing::error!(query = prepped, "prepped");
+
+        let mut prepped = conn.prepare_cached(&prepped)?;
 
         let col_count = prepped.column_count();
 
@@ -1144,7 +1147,7 @@ impl Matcher {
                     [table.as_str()],
                 )?;
                 for column in columns.iter() {
-                    trace!("inserting sub column {} => {}", table, column);
+                    trace!("inserting sub column {table} => {column}");
                     tx.execute(
                         r#"INSERT INTO columns ("table", cid) VALUES (?, ?)"#,
                         [table.as_str(), column.as_str()],
@@ -1226,9 +1229,9 @@ impl Matcher {
             enquote::enquote('\'', self.db_name.as_str()),
         )) {
             error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
-            _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
+            drop(self.evt_tx.try_send(QueryEvent::Error(format_compact!(
                 "could not ATTACH subscription db: {e}"
-            )));
+            ))));
             return Err(e.into());
         }
 
@@ -1284,20 +1287,9 @@ impl Matcher {
 
             let branch = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => {
-                    info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
-                    if let Err(e) = self.set_status("cancelled") {
-                        error!(sub_id = %self.id, "could not set status during cancellation: {e}");
-                    }
-                    info!(sub_id = %self.id, "attempting to cleanup");
-                    if let Err(e) = self.remove_db_dir() {
-                        error!("could not handle cleanup: {e}");
-                    } else {
-                        info!("cleaned {}", self.db_name.as_str());
-                    }
-                    return;
-                }
                 Some(candidates) = self.changes_rx.recv() => {
+                    tracing::trace!(count = candidates.values().map(|v| v.len()).sum::<usize>(), "received candidates");
+
                     for (table, pks) in  candidates {
                         let buffed = buf.entry(table).or_default();
                         for (pk, cl) in pks {
@@ -1323,6 +1315,19 @@ impl Matcher {
                     }
                     Branch::NewCandidates(std::mem::take(&mut buf))
                 },
+                _ = self.cancel.cancelled() => {
+                    info!(sub_id = %self.id, "Acknowledged subscription cancellation, breaking loop.");
+                    if let Err(e) = self.set_status("cancelled") {
+                        error!(sub_id = %self.id, "could not set status during cancellation: {e}");
+                    }
+                    info!(sub_id = %self.id, "attempting to cleanup");
+                    if let Err(e) = self.remove_db_dir() {
+                        error!("could not handle cleanup: {e}");
+                    } else {
+                        info!("cleaned {}", self.db_name.as_str());
+                    }
+                    return;
+                }
                 _ = &mut tripwire => {
                     info!(sub_id = %self.id, "tripped cmd_loop, returning");
                     // just return!
@@ -1381,7 +1386,7 @@ impl Matcher {
 
                     // Maybe send the result back to the caller
                     if let Some(response_tx) = maybe_response_tx {
-                        let _ = response_tx.send(res);
+                        drop(response_tx.send(res));
                     }
                 }
             }
@@ -1592,10 +1597,11 @@ impl Matcher {
             }
             Err(e) => {
                 warn!(sub_id = %self.id, "could not complete initial query: {e}");
-                _ = self
-                    .evt_tx
-                    .send(QueryEvent::Error(e.to_compact_string()))
-                    .await;
+                drop(
+                    self.evt_tx
+                        .send(QueryEvent::Error(e.to_compact_string()))
+                        .await,
+                );
 
                 return;
             }
@@ -1617,13 +1623,11 @@ impl Matcher {
     ) -> Result<(), MatcherError> {
         let mut tables = IndexSet::new();
 
-        if candidates.is_empty() {
-            return Ok(());
-        }
+        assert!(!candidates.is_empty());
 
         trace!(
-            "got some candidates! {:?}",
-            candidates.keys().collect::<Vec<_>>()
+            count = candidates.values().map(|v| v.len()).sum::<usize>(),
+            "got some candidates",
         );
 
         let tx = self.conn.transaction()?;
@@ -1631,7 +1635,7 @@ impl Matcher {
             let pks = pks
                 .iter()
                 .map(|(pk, _)| unpack_columns(pk))
-                .collect::<Result<Vec<Vec<SqliteValueRef>>, _>>()?;
+                .collect::<Result<Vec<Vec<SqliteValueRef<'_>>>, _>>()?;
 
             let tmp_table_name = format!("temp_{table}");
             if tables.insert(table.clone()) {
@@ -3312,8 +3316,11 @@ mod tests {
             matcher.filter_matchable_change(&mut candidates, (&change).into());
         }
 
+        let len = candidates.len();
         if let Err(e) = matcher.inner.changes_tx.try_send(candidates) {
             error!(sub_id = %matcher.inner.id, "could not send candidates to matcher: {e}");
+        } else {
+            trace!(sub_id = %matcher.inner.id, len, "sent changes");
         }
         Ok(())
     }

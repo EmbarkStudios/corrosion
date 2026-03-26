@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},
@@ -33,7 +33,7 @@ impl MemberState {
             cluster_id,
             ring: None,
             last_sync_ts: None,
-            member_id: member_id,
+            member_id,
         }
     }
 
@@ -72,7 +72,7 @@ pub enum MemberAddedResult {
 impl Members {
     pub fn new(member_id: Option<MemberId>) -> Self {
         Members {
-            member_id: member_id,
+            member_id,
             ..Default::default()
         }
     }

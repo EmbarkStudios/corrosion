@@ -282,14 +282,14 @@ impl Agent {
 
 pub fn migrate(clock: Arc<uhlc::HLC>, conn: &mut Connection) -> rusqlite::Result<()> {
     let migrations: Vec<Box<dyn Migration>> = vec![
-        Box::new(init_migration as fn(&Transaction) -> rusqlite::Result<()>),
+        Box::new(init_migration as fn(&Transaction<'_>) -> rusqlite::Result<()>),
         Box::new(crsqlite_v0_17_migration(clock)),
     ];
 
     crate::sqlite::migrate(conn, migrations)
 }
 
-fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
+fn init_migration(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     tx.execute_batch(
         r#"
             -- key/value for internal corrosion data (e.g. 'schema_version' => INT)
@@ -378,10 +378,10 @@ fn init_migration(tx: &Transaction) -> rusqlite::Result<()> {
 // also sets the new 'merge-equal-values' config to true.
 fn crsqlite_v0_17_migration(
     clock: Arc<uhlc::HLC>,
-) -> impl Fn(&Transaction) -> rusqlite::Result<()> {
+) -> impl Fn(&Transaction<'_>) -> rusqlite::Result<()> {
     let ts = Timestamp::from(clock.new_timestamp()).as_u64().to_string();
 
-    move |tx: &Transaction| -> rusqlite::Result<()> {
+    move |tx: &Transaction<'_>| -> rusqlite::Result<()> {
         let tables: Vec<String> = tx.prepare("SELECT tbl_name FROM sqlite_master WHERE type='table' AND tbl_name LIKE '%__crsql_clock'")?.query_map([], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
 
         for table in tables {

@@ -1107,9 +1107,10 @@ pub fn process_empty_version<T: Deref<Target = rusqlite::Connection> + Committab
     actor_id: ActorId,
     end_version: &CrsqlDbVersion,
 ) -> rusqlite::Result<()> {
-    let _ = tx
-        .prepare_cached("SELECT crsql_set_db_version(?, ?)")?
-        .query_row((actor_id, end_version), |row| row.get::<_, String>(0))?;
+    drop(
+        tx.prepare_cached("SELECT crsql_set_db_version(?, ?)")?
+            .query_row((actor_id, end_version), |row| row.get::<_, String>(0))?,
+    );
 
     Ok(())
 }

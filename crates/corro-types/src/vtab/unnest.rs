@@ -70,15 +70,16 @@ impl ValuesExt for Values<'_> {
         unsafe {
             // Assert at compile time that layouts match
             const _: () = assert!(
-                std::mem::size_of::<Values>() == std::mem::size_of::<&[*mut ffi::sqlite3_value]>()
+                std::mem::size_of::<Values<'_>>()
+                    == std::mem::size_of::<&[*mut ffi::sqlite3_value]>()
             );
             const _: () = assert!(
-                std::mem::align_of::<Values>()
+                std::mem::align_of::<Values<'_>>()
                     == std::mem::align_of::<&[*mut ffi::sqlite3_value]>()
             );
 
             // Values has a single field: args: &[*mut sqlite3_value]
-            let args_ptr = self as *const Values as *const &[*mut ffi::sqlite3_value];
+            let args_ptr = self as *const Self as *const &[*mut ffi::sqlite3_value];
             let args = *args_ptr;
 
             if idx >= args.len() {

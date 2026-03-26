@@ -88,12 +88,15 @@ impl Clone for Tripwire {
 impl Future for Tripwire {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             match futures::ready!(Pin::new(&mut self.subscription).poll_next(cx)) {
                 Some(TripwireState::Running) => {}
                 Some(TripwireState::ShuttingDown) => return Poll::Ready(()),
-                None => return Poll::Ready(()),
+                None => {
+                    tracing::trace!("yo wtf");
+                    return Poll::Ready(());
+                }
             }
         }
     }
@@ -111,7 +114,7 @@ where
 {
     type Output = F::Output;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Poll::Ready(()) = Pin::new(&mut self.tripwire).poll(cx) {
             return Poll::Ready(());
         }

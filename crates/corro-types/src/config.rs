@@ -187,7 +187,7 @@ impl<'de> Deserialize<'de> for ApiConfig {
         impl<'de> serde::de::Visitor<'de> for BindAddr {
             type Value = Vec<SocketAddr>;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("single or multiple socket addresses")
             }
 
@@ -227,7 +227,7 @@ impl<'de> Deserialize<'de> for ApiConfig {
         impl<'de> serde::de::Visitor<'de> for PgConfigs {
             type Value = Vec<PgConfig>;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("single or multiple postgres configs")
             }
 
@@ -268,7 +268,7 @@ impl<'de> Deserialize<'de> for ApiConfig {
         impl<'de> serde::de::Visitor<'de> for Visitor {
             type Value = ApiConfig;
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("ApiConfig")
             }
 

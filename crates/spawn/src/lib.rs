@@ -125,12 +125,12 @@ pub async fn wait_for_all_pending_handles() {
             }
             _ = &mut wait => {
                 handle.close();
-                let _ = sig.await;
+                drop(sig.await);
                 return;
             }
         }
 
-        let _ = wait.await;
+        drop(wait.await);
     }
 
     #[cfg(not(all(unix, debug_assertions)))]

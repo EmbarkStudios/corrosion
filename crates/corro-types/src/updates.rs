@@ -26,7 +26,7 @@ use tripwire::Tripwire;
 use uuid::Uuid;
 
 pub trait Manager<H> {
-    fn trait_type(&self) -> String;
+    fn trait_type(&self) -> &'static str;
     fn get(&self, id: &Uuid) -> Option<H>;
     fn remove(&self, id: &Uuid) -> Option<H>;
     fn get_handles(&self) -> BTreeMap<Uuid, H>;
@@ -39,7 +39,7 @@ pub trait Handle {
     fn filter_matchable_change(
         &self,
         candidates: &mut MatchCandidates,
-        change: MatchableChange,
+        change: &MatchableChange<'_>,
     ) -> bool;
     fn changes_tx(&self) -> mpsc::Sender<MatchCandidates>;
     async fn cleanup(&self);
@@ -52,7 +52,7 @@ pub struct HandleMetrics {
 }
 
 impl std::fmt::Debug for HandleMetrics {
-    fn fmt(&self, f: &mut Formatter) -> Result<(), std::fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Counter").finish_non_exhaustive()
     }
 }
@@ -61,8 +61,8 @@ impl std::fmt::Debug for HandleMetrics {
 pub struct UpdatesManager(Arc<RwLock<InnerUpdatesManager>>);
 
 impl Manager<UpdateHandle> for UpdatesManager {
-    fn trait_type(&self) -> String {
-        "updates".to_string()
+    fn trait_type(&self) -> &'static str {
+        "updates"
     }
 
     fn get(&self, id: &Uuid) -> Option<UpdateHandle> {
@@ -92,7 +92,7 @@ impl Handle for UpdateHandle {
     fn filter_matchable_change(
         &self,
         candidates: &mut MatchCandidates,
-        change: MatchableChange,
+        change: &MatchableChange<'_>,
     ) -> bool {
         if change.table.to_string() != self.inner.name {
             return false;
@@ -284,7 +284,7 @@ fn handle_candidates(
         let pks = pks
             .iter()
             .map(|(pk, cl)| unpack_columns(pk).map(|x| (x, *cl)))
-            .collect::<Result<Vec<(Vec<SqliteValueRef>, i64)>, _>>()?;
+            .collect::<Result<Vec<(Vec<SqliteValueRef<'_>>, i64)>, _>>()?;
 
         for (pk, cl) in pks {
             let mut change_type = ChangeType::Update;
@@ -440,12 +440,10 @@ where
     for (id, handle) in handles.iter() {
         trace!(sub_id = %id, %db_version, "attempting to match changes to a subscription");
         let mut candidates = MatchCandidates::new();
-        let mut match_count = 0;
-        for change in changes.matchable_changes() {
-            if handle.filter_matchable_change(&mut candidates, change) {
-                match_count += 1;
-            }
-        }
+        let match_count = changes
+            .matchable_changes()
+            .filter(|change| handle.filter_matchable_change(&mut candidates, change))
+            .count();
 
         // metrics...
         for (table, pks) in candidates.iter() {
@@ -456,6 +454,10 @@ where
         }
 
         trace!(sub_id = %id, %db_version, "found {match_count} candidates");
+
+        if candidates.is_empty() {
+            return;
+        }
 
         if let Err(e) = handle.changes_tx().try_send(candidates) {
             error!(sub_id = %id, "could not send change candidates to {trait_type} handler: {e}");
@@ -479,6 +481,8 @@ where
                     }
                 }
             }
+        } else {
+            trace!("candidates sent");
         }
     }
 }
@@ -533,7 +537,7 @@ where
                     column: &column,
                     cl,
                 };
-                handle.filter_matchable_change(candidates, change);
+                handle.filter_matchable_change(candidates, &change);
             }
         }
     }

@@ -52,7 +52,7 @@ pub(super) async fn negotiate_ssl(
                         }
                     }
                     PgWireFrontendMessage::GssEncRequest(_) => {
-                        let _ = socket.next().await;
+                        drop(socket.next().await);
                         socket
                             .send(PgWireBackendMessage::GssEncResponse(GssEncResponse::Refuse))
                             .await?;
