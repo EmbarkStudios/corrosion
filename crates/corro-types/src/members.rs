@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, net::SocketAddr, ops::Range, time::Duration};
 
 use circular_buffer::CircularBuffer;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace};
+use tracing::{debug, trace};
 
 use crate::{
     actor::{Actor, ActorId, ClusterId, MemberId},

@@ -4,10 +4,7 @@ use std::{
     net::SocketAddr,
     ops::{Deref, DerefMut, RangeInclusive},
     path::PathBuf,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -580,7 +577,7 @@ impl SplitPool {
         debug!("built RO pool");
 
         Ok(Self::new(
-            path.as_ref().to_owned(),
+            path.into(),
             write_sema,
             cache_size_kib,
             ro_pool,

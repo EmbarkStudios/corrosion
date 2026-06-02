@@ -138,7 +138,7 @@ impl SubsManager {
 
         let handle_res = Matcher::create(
             id,
-            subs_path,
+            subs_path.to_owned(),
             schema,
             pool.client_dedicated()?,
             evt_tx,
@@ -152,7 +152,7 @@ impl SubsManager {
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
 
-                if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(subs_path, id)) {
+                if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(&subs_path, id)) {
                     error!("could not cleanup subscription: {e}");
                 }
 
@@ -186,7 +186,7 @@ impl SubsManager {
 
         let handle = Matcher::restore(
             id,
-            subs_path,
+            subs_path.to_owned(),
             schema,
             pool.client_dedicated()?,
             evt_tx,
@@ -781,8 +781,12 @@ impl Matcher {
                 .collect()
         };
 
+        db_name.create()?;
         let conn = Connection::open(db_name.as_ref())?;
         trace_heavy_queries_subs(&conn)?;
+
+        info!(%sql_hash, sub_id = %id, db_name = db_name.as_str(), "Initializing subscription");
+
         conn.execute_batch(
             r#"
                 PRAGMA journal_mode = WAL;
@@ -1066,14 +1070,14 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn restore(
         id: Uuid,
-        subs_path: &Utf8Path,
+        subs_path: Utf8PathBuf,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
         tripwire: Tripwire,
         loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
-        let db_name = DbName::new(id, subs_path);
+        let db_name = DbName::new(id, &subs_path);
 
         let sql: String = block_in_place(|| {
             let conn = Connection::open(db_name.as_ref())?;
@@ -1104,7 +1108,7 @@ impl Matcher {
         spawn_counted(async move {
             if let Err(e) = matcher.run_restore(state_conn, tripwire).await {
                 error!(sub_id = %id, "could not run restore: {e}");
-                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
+                if let Err(e) = Self::cleanup(id, &Matcher::sub_path(&subs_path, id)) {
                     error!(sub_id = %id, "could not cleanup: {e}");
                 }
             }
@@ -1116,7 +1120,7 @@ impl Matcher {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         id: Uuid,
-        subs_path: &Utf8Path,
+        subs_path: Utf8PathBuf,
         schema: &Schema,
         state_conn: CrConn,
         evt_tx: mpsc::Sender<QueryEvent>,
@@ -1124,7 +1128,7 @@ impl Matcher {
         tripwire: Tripwire,
         loop_cfg: MatcherLoopConfig,
     ) -> Result<MatcherHandle, MatcherError> {
-        let db_name = DbName::new(id, subs_path);
+        let db_name = DbName::new(id, &subs_path);
         let (mut matcher, handle) =
             Self::new(id, db_name, schema, &state_conn, evt_tx, sql, loop_cfg)?;
 
@@ -1230,7 +1234,7 @@ impl Matcher {
         spawn_counted(async move {
             if let Err(e) = matcher.run(state_conn, tripwire).await {
                 error!(sub_id = %id, "could not setup subscription: {e}");
-                if let Err(e) = Self::cleanup(id, Matcher::sub_path(&subs_path, id)) {
+                if let Err(e) = Self::cleanup(id, &Matcher::sub_path(&subs_path, id)) {
                     error!(sub_id = %id, "could not cleanup: {e}");
                 }
             }
@@ -1493,7 +1497,7 @@ impl Matcher {
 
         let Some(col_str) = ColStr::new(self.parsed.columns.len()) else {
             error!(sub_id = %self.id, "must query at least 1 column");
-            return;
+            return Err(MatcherError::MissingSql);
         };
 
         let write_all_cols = |s: &mut String| {
