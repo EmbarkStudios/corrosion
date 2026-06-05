@@ -13,7 +13,7 @@ use compact_str::{format_compact, ToCompactString};
 use corro_api_types::{
     ChangeId, ColumnName, ColumnType, RowId, SqliteValue, SqliteValueRef, TableName,
 };
-use enquote::unquote;
+use corro_utils::enquote::unquote;
 use fallible_iterator::FallibleIterator;
 use indexmap::{IndexMap, IndexSet};
 use metrics::{counter, histogram};
@@ -1289,7 +1289,7 @@ impl Matcher {
         info!(sub_id = %self.id, "Attaching __corro_sub to state db");
         if let Err(e) = state_conn.execute_batch(&format!(
             "ATTACH DATABASE {} AS __corro_sub",
-            enquote::enquote('\'', self.db_name.as_str()),
+            corro_utils::enquote::enquote('\'', self.db_name.as_str()),
         )) {
             error!(sub_id = %self.id, "could not ATTACH sub db as __corro_sub on state db: {e}");
             _ = self.evt_tx.try_send(QueryEvent::Error(format_compact!(
@@ -2149,7 +2149,7 @@ fn extract_expr_columns(
         }
 
         Expr::Name(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
+            let check_col_name = unquote(&colname.0);
 
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
@@ -2180,7 +2180,7 @@ fn extract_expr_columns(
         }
 
         Expr::Id(colname) => {
-            let check_col_name = unquote(&colname.0).ok().unwrap_or(colname.0.clone());
+            let check_col_name = unquote(&colname.0);
 
             let mut found = None;
             for tbl in parsed.table_columns.keys() {
