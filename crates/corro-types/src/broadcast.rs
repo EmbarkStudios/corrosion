@@ -103,11 +103,28 @@ pub struct ColumnChange {
     pub cl: i64,
 }
 
-#[derive(Debug, Clone, Copy, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
+#[derive(Debug, Clone, Copy)]
 pub enum ChangeSource {
     Broadcast,
     Sync,
+}
+
+impl ChangeSource {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Broadcast => "broadcast",
+            Self::Sync => "sync",
+        }
+    }
+
+    #[inline]
+    pub fn is_broadcast(&self) -> bool {
+        match self {
+            Self::Broadcast => true,
+            Self::Sync => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Readable, Writable)]
