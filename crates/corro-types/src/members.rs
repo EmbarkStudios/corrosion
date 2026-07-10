@@ -33,7 +33,7 @@ impl MemberState {
             cluster_id,
             ring: None,
             last_sync_ts: None,
-            member_id: member_id,
+            member_id,
         }
     }
 
@@ -72,7 +72,7 @@ pub enum MemberAddedResult {
 impl Members {
     pub fn new(member_id: Option<MemberId>) -> Self {
         Members {
-            member_id: member_id,
+            member_id,
             ..Default::default()
         }
     }

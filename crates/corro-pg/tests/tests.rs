@@ -474,7 +474,7 @@ async fn test_pg_ssl() {
         let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
         root_cert_store
             .add(rustls::pki_types::CertificateDer::from_slice(
-                &certs.ca_cert.der(),
+                certs.ca_cert.der(),
             ))
             .unwrap();
         let config = rustls::ClientConfig::builder()
@@ -537,7 +537,7 @@ async fn test_pg_mtls() {
         let mut root_cert_store = tokio_rustls::rustls::RootCertStore::empty();
         root_cert_store
             .add(rustls::pki_types::CertificateDer::from_slice(
-                &certs.ca_cert.der(),
+                certs.ca_cert.der(),
             ))
             .expect("failed to add root cert");
 
@@ -1142,7 +1142,7 @@ async fn test_unnest_vtab() {
             let joiner = [1i64, 2];
             let rows = client
                 .query(
-                    "SELECT t.id, t.text, CAST(u.value0 AS int) FROM tests t 
+                    "SELECT t.id, t.text, CAST(u.value0 AS int) FROM tests t
                      JOIN unnest(CAST($1 AS int[])) u ON t.id = u.value0",
                     &[&joiner],
                 )

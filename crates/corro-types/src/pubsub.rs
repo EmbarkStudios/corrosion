@@ -152,7 +152,7 @@ impl SubsManager {
             Err(e) => {
                 error!(sub_id = %id, "could not create subscription: {e}");
 
-                if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(&subs_path, id)) {
+                if let Err(e) = Matcher::cleanup(id, &Matcher::sub_path(subs_path, id)) {
                     error!("could not cleanup subscription: {e}");
                 }
 

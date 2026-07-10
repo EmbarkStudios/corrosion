@@ -1012,7 +1012,7 @@ pub async fn handle_changes(
         }
 
         // Update logical clock if needed
-        let src_str: &'static str = src.into();
+        let src_str: &'static str = src.as_str();
         let recv_lag = change.ts().and_then(|ts| {
             let mut our_ts = Timestamp::from(agent.clock().new_timestamp());
             if ts > our_ts {
