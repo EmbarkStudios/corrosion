@@ -8,9 +8,7 @@ use metrics::counter;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use rusqlite::types::{ToSql, ToSqlOutput, Value};
-use rusqlite::{
-    params, trace::TraceEventCodes, vtab::eponymous_only_module, Connection, Transaction, MAIN_DB,
-};
+use rusqlite::{params, trace::TraceEventCodes, vtab::Module, Connection, Transaction, MAIN_DB};
 use sqlite_pool::SqliteConn;
 use std::rc::Rc;
 use tempfile::TempDir;
@@ -183,7 +181,7 @@ pub fn log_slow_inflight_queries() {
     });
 }
 
-pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
+pub fn trace_heavy_queries(conn: &mut Connection) -> rusqlite::Result<()> {
     let readonly = conn.is_readonly(MAIN_DB)?;
     conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE | TraceEventCodes::SQLITE_TRACE_STMT,
@@ -192,20 +190,18 @@ pub fn trace_heavy_queries(conn: &Connection) -> rusqlite::Result<()> {
         } else {
             tracing_callback_rw
         }),
-    );
-    Ok(())
+    )
 }
 
 /// Install tracing on a connection used by subscription matchers.
 /// Writes to a separate SUBS_QUERY_STATS so subs sqlite time is
 /// bucketed into `corro.subs.db.query.ms` / `corro.subs.db.query.count`
 /// instead of the general `corro.db.query.*` metrics.
-pub fn trace_heavy_queries_subs(conn: &Connection) -> rusqlite::Result<()> {
+pub fn trace_heavy_queries_subs(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.trace_v2(
         TraceEventCodes::SQLITE_TRACE_PROFILE,
         Some(tracing_callback_subs),
-    );
-    Ok(())
+    )
 }
 
 fn tracing_callback_subs(ev: rusqlite::trace::TraceEvent) {
@@ -287,7 +283,7 @@ pub fn rusqlite_to_crsqlite(mut conn: rusqlite::Connection) -> rusqlite::Result<
     setup_conn(&conn)?;
     sqlite_functions::add_to_connection(&conn)?;
 
-    trace_heavy_queries(&conn)?;
+    trace_heavy_queries(&mut conn)?;
 
     Ok(CrConn(conn))
 }
@@ -369,9 +365,12 @@ pub fn setup_conn(conn: &Connection) -> Result<(), rusqlite::Error> {
 
     rusqlite::vtab::series::load_module(conn)?;
 
+    const UNNEST: Module<UnnestTab> = Module::eponymous_only_module();
+    const CORRO_UNNEST: Module<UnnestTab> = Module::eponymous_only_module();
+
     // Register unnest for PostgreSQL-style multi-array unnesting
-    conn.create_module("unnest", eponymous_only_module::<UnnestTab>(), None)?;
-    conn.create_module("corro_unnest", eponymous_only_module::<UnnestTab>(), None)?;
+    conn.create_module("unnest", &UNNEST, None)?;
+    conn.create_module("corro_unnest", &CORRO_UNNEST, None)?;
 
     Ok(())
 }
@@ -450,7 +449,7 @@ where
     Rc::new(
         iter.into_iter()
             .map(|to_sql| match to_sql.to_sql() {
-                Ok(ToSqlOutput::Borrowed(v)) => v.into(),
+                Ok(ToSqlOutput::Borrowed(v)) => v.try_into().expect("value conversion failure"),
                 Ok(ToSqlOutput::Owned(v)) => v,
                 _ => panic!("Nope"),
             })

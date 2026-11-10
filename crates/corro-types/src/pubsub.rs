@@ -776,14 +776,13 @@ impl Matcher {
             state_conn
                 .prepare(sql)?
                 .column_names()
-                .into_iter()
                 .map(|s| ColumnName(s.to_compact_string()))
                 .collect()
         };
 
         db_name.create()?;
-        let conn = Connection::open(db_name.as_ref())?;
-        trace_heavy_queries_subs(&conn)?;
+        let mut conn = Connection::open(db_name.as_ref())?;
+        trace_heavy_queries_subs(&mut conn)?;
 
         info!(%sql_hash, sub_id = %id, db_name = db_name.as_str(), "Initializing subscription");
 
@@ -3135,7 +3134,6 @@ mod tests {
                 let mut prepped = conn.prepare("SELECT * FROM changes").unwrap();
                 let cols = prepped
                     .column_names()
-                    .iter()
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>();
                 let mut rows = prepped.query([]).unwrap();

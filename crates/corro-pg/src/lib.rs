@@ -52,8 +52,7 @@ use pgwire::{
 use postgres_types::{FromSql, Type};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use rusqlite::{
-    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef,
-    vtab::eponymous_only_module, Connection, Statement,
+    ffi::SQLITE_CONSTRAINT_UNIQUE, functions::FunctionFlags, types::ValueRef, Connection, Statement,
 };
 use rustls::ServerConfig;
 use socket2::{SockRef, TcpKeepalive};
@@ -873,29 +872,37 @@ pub async fn start(
 
                         let dbs = Arc::new(vec![PgDatabase::new("state".into())]);
 
+                        use rusqlite::vtab::Module;
+
+                        const PG_DB: Module<PgDatabaseTable> = Module::eponymous_only_module();
+                        const PG_TYPE: Module<PgTypeTable> = Module::eponymous_only_module();
+                        const PG_RANGE: Module<PgRangeTable> = Module::eponymous_only_module();
+                        const PG_NAMESPACE: Module<PgNamespaceTable> = Module::eponymous_only_module();
+                        const PG_CLASS: Module<PgClassTable> = Module::eponymous_only_module();
+
                         conn.create_module(
                             "pg_database",
-                            eponymous_only_module::<PgDatabaseTable>(),
+                            &PG_DB,
                             Some(dbs),
                         )?;
                         conn.create_module(
                             "pg_type",
-                            eponymous_only_module::<PgTypeTable>(),
+                            &PG_TYPE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_range",
-                            eponymous_only_module::<PgRangeTable>(),
+                            &PG_RANGE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_namespace",
-                            eponymous_only_module::<PgNamespaceTable>(),
+                            &PG_NAMESPACE,
                             None,
                         )?;
                         conn.create_module(
                             "pg_class",
-                            eponymous_only_module::<PgClassTable>(),
+                            &PG_CLASS,
                             None,
                         )?;
 
@@ -3757,7 +3764,7 @@ fn field_types(
     }
 
     let mut fields = vec![];
-    for (i, col) in prepped.columns().iter().enumerate() {
+    for (i, col) in prepped.columns().enumerate() {
         let col_name = col.name();
         let col_type = match field_type_overrides.remove(col_name) {
             Some(t) => t,

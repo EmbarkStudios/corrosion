@@ -16,17 +16,20 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
 
     fn connect(
         _: &mut VTabConnection,
-        _aux: Option<&()>,
-        args: &[&[u8]],
-    ) -> rusqlite::Result<(String, PgRangeTable)> {
+        _aux: Option<&Self::Aux>,
+        _module_name: &[u8],
+        _database_name: &[u8],
+        table_name: &[u8],
+        _args: &[&[u8]],
+    ) -> rusqlite::Result<(std::borrow::Cow<'static, std::ffi::CStr>, Self)> {
         let vtab = PgRangeTable {
             base: sqlite3_vtab::default(),
         };
 
-        let table_name = std::str::from_utf8(args[0]).map_err(rusqlite::Error::Utf8Error)?;
+        let table_name = std::str::from_utf8(table_name)?;
 
         Ok((
-            format!(
+            std::ffi::CString::new(format!(
                 "CREATE TABLE {table_name} (
                 rngtypid 	INTEGER,
                 rngsubtype	INTEGER,
@@ -36,14 +39,16 @@ unsafe impl<'vtab> VTab<'vtab> for PgRangeTable {
                 rngcanonical	TEXT,
                 rngsubdiff	TEXT
 		    )"
-            ),
+            ))
+            .unwrap()
+            .into(),
             vtab,
         ))
     }
 
-    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<()> {
+    fn best_index(&self, info: &mut IndexInfo) -> rusqlite::Result<bool> {
         info.set_estimated_cost(1.);
-        Ok(())
+        Ok(true)
     }
 
     fn open(&'vtab mut self) -> rusqlite::Result<PgRangeTableCursor<'vtab>> {
